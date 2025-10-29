@@ -1,6 +1,7 @@
 #include <hardware.h>
 #include <plan.h>
 #include <table.h>
+#include "HopscotchHash.h"
 
 namespace Contest {
 
@@ -19,7 +20,8 @@ struct JoinAlgorithm {
     template <class T>
     auto run() {
         namespace views = ranges::views;
-        std::unordered_map<T, std::vector<size_t>> hash_table;
+        size_t expected = build_left ? left.size() : right.size();  //function to take the expected elements we are going to add
+        HopscotchHashMap<T, std::vector<size_t>> hash_table(expected);
         if (build_left) {
             for (auto&& [idx, record]: left | views::enumerate) {
                 std::visit(
