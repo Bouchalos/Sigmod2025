@@ -36,8 +36,13 @@ private:
     size_t table_size;      //the size of the table
     size_t element_count;   //the total elements I have in the table
 
-    size_t hash(const Key& key) const {         //the hash function
-        return std::hash<Key>{}(key) % table_size;
+    size_t hash(const Key& key) const {
+        const unsigned char* data = reinterpret_cast<const unsigned char*>(&key);
+        size_t hash = 5381;
+        for (size_t i = 0; i < sizeof(Key); ++i) {
+            hash = ((hash << 5) + hash) + data[i]; // djb2: hash * 33 + byte
+        }
+        return hash % table_size;
     }
 
     void rehash(){      //rehash function
