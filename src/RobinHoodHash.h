@@ -83,50 +83,47 @@ public:
         size_t base = hash(key);
         size_t idx = base;
         size_t dist = 0;
-        while(table[idx].distance >= dist && table[idx].kv){    
-            if (table[idx].kv && table[idx].kv->first == key) {     //when we find the key
+        while(table[idx].kv && table[idx].distance >= dist){    
+            if (table[idx].kv->first == key) {     //when we find the key
                     return iterator(table.begin() + idx, table.end());  //returns an iterator to keys position
             }
-            if(idx == table_size - 1){
-                idx = 0;
-                dist ++;
-                continue;
-            }
-            idx ++;
-            dist ++;
+            idx = (idx + 1) % table_size;
+            ++dist;
         }
         return end();
     }
 
-    pair<iterator,bool> emplace(const Key& key, const Value& value){
-        size_t base = hash(key);    //the bucket that we want to place the kv 
-        size_t dist = 0;        //distance from my bucket 
-        size_t idx = base;
-        while(table[idx].distance >= dist && table[idx].kv){    //tries to find the next bucket that is empty or it's element's distance is sorter than the new ones
-            if(idx == table_size - 1){
-                idx = 0;
-                dist ++;
-                continue;
+    pair<iterator, bool> emplace(const Key& key, const Value& value) {
+        size_t idx = hash(key);
+        size_t dist = 0;
+
+        Key cur_key = key;
+        Value cur_val = value;
+
+        while (true) {
+            if (!table[idx].kv) {       //if we find an empty bucket we add that element there
+                table[idx].kv.emplace(cur_key, cur_val);
+                table[idx].distance = dist;
+                ++element_count;
+                break;
             }
-            dist ++;
-            idx ++;
-        }
-        if(table[idx].kv){      //we free the bucket and place the new element
-            auto kv = table[idx].kv;
-            table[idx].kv.reset();
-            table[idx].distance = dist;
-            table[idx].kv = make_pair(key, value);
-            emplace(kv.value().first, kv.value().second);       //we insert the old element again 
-        }
-        else{
-            table[idx].distance = dist;
-            table[idx].kv = make_pair(key, value);
-            element_count ++;
-            double load_factor = static_cast<double>(element_count) / static_cast<double>(table_size);
-            if(load_factor > 0.6){
-                rehash();
+
+            if (table[idx].distance < dist) {   //swaps if we find any bucket with an element that has sorter dist
+                std::swap(cur_key, table[idx].kv->first);  //loops for that element
+                std::swap(cur_val, table[idx].kv->second);
+                std::swap(dist, table[idx].distance);
             }
+
+            idx = (idx + 1) % table_size;
+            ++dist;
         }
-        return std::make_pair(iterator(table.begin() + idx, table.end()), true);
+
+        double load_factor = static_cast<double>(element_count) / static_cast<double>(table_size);
+        if(load_factor > 0.6){
+            rehash();
+        }
+    
+        return { iterator(table.begin() + idx, table.end()), true };
     }
+
 };
