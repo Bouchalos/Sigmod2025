@@ -5,7 +5,7 @@
 #include <hardware.h>
 #include <plan.h>
 #include <table.h>
-#include "HopscotchHash.h"
+#include <utility>
 
 
 //choose hash backend via macros
@@ -13,7 +13,7 @@
 #if defined(USE_CUCKOO)
   #include "cuckoo_multimap.h"   // -DUSE_CUCKOO  -> cuckoo_multimap.h   (class cuckoo::CuckooMultiMap<K,size_t>)
 #elif defined(USE_ROBIN)
-  #include "robin_multimap.h"    // -DUSE_ROBIN   -> robin_multimap.h    (class RobinHoodMultiMap<K,size_t>)
+  #include "RobinHoodHash.h"    // -DUSE_ROBIN   -> RobinHoodHash.h   (class RobinHoodMultiMap<K,size_t>)
 #else
   #include "HopscotchHash.h"     // (default)     -> HopscotchHash.h     (class HopscotchHashMap<K, std::vector<size_t>>)
 #endif
@@ -29,47 +29,91 @@ using ExecuteResult = std::vector<std::vector<Data>>;
 template <typename K>
 struct KeyToRows {
 #if defined(USE_HOP)
-    
+
     mutable HopscotchHashMap<K, std::vector<size_t>> impl;
 
-    void reserve(size_t) {
-        
-    }
+    void reserve(size_t) {}
 
-    void insert(const K& k, size_t v) {
+    template <class KK>
+    void emplace(KK&& k, size_t v) {
         auto it = impl.find(k);
         if (it == impl.end()) {
-            //first time we see this key -> create vector with one row id
-            impl.emplace(k, std::vector<size_t>{v});
+            impl.emplace(std::forward<KK>(k), std::vector<size_t>{v});
         } else {
-            //append another row id
-            it->second.push_back(v);
+            it->second.emplace_back(v);
         }
     }
 
     template <class Fn>
     void for_each(const K& k, Fn&& f) const {
         auto it = impl.find(k);
-        if (it == impl.end()) return;          // no matches
-        for (auto idx : it->second) f(idx);     
+        if (it == impl.end()) return;
+        for (auto idx : it->second) f(idx);
     }
 
 #elif defined(USE_CUCKOO)
-    cuckoo::CuckooMultiMap<K, size_t> impl;
-    void reserve(size_t n)                 { impl.reserve(n); }
-    void insert(const K& k, size_t v)      { impl.insert(k, v); }
-    template <class Fn>
-    void for_each(const K& k, Fn&& f) const { impl.for_each(k, std::forward<Fn>(f)); }
 
-#else
-    std::unordered_map<K, std::vector<size_t>> impl;
-    void reserve(size_t n)                 { impl.reserve(n); }
-    void insert(const K& k, size_t v)      { impl[k].push_back(v); }
+    cuckoo::CuckooMultiMap<K, size_t> impl;
+
+    void reserve(size_t n) { impl.reserve(n); }
+
+    template <class KK>
+    void emplace(KK&& k, size_t v) {
+        impl.emplace(std::forward<KK>(k), v);
+    }
+
+    // ΝΕΟ: προώθησε το find του CuckooMultiMap
+    template <class Fn>
+    bool find(const K& k, Fn&& f) const {
+        return impl.find(k, std::forward<Fn>(f));
+    }
+
+    // (Προαιρετικό) κράτα το for_each ως wrapper στο find
+    template <class Fn>
+    void for_each(const K& k, Fn&& f) const {
+        (void)impl.find(k, std::forward<Fn>(f)); // αγνόησε το bool
+    }
+
+
+#elif defined(USE_ROBIN)
+
+    mutable RobinHoodHashMap<K, std::vector<size_t>> impl;
+
+    void reserve(size_t) {}
+
+    template <class KK>
+    void emplace(KK&& k, size_t v) {
+        auto it = impl.find(k);
+        if (it == impl.end()) {
+            impl.emplace(std::forward<KK>(k), std::vector<size_t>{v});
+        } else {
+            it->second.emplace_back(v);
+        }
+    }
+
     template <class Fn>
     void for_each(const K& k, Fn&& f) const {
         auto it = impl.find(k);
         if (it == impl.end()) return;
-        for (auto v : it->second) f(v);
+        for (auto idx : it->second) f(idx);
+    }
+
+#else
+    // διόρθωση typos: std::unordered_map
+    std::unordered_map<K, std::vector<size_t>> impl;
+
+    void reserve(size_t n) { impl.reserve(n); }
+
+    template <class KK>
+    void emplace(KK&& k, size_t v) {
+        impl[std::forward<KK>(k)].emplace_back(v);
+    }
+
+    template <class Fn>
+    void for_each(const K& k, Fn&& f) const {
+        auto it = impl.find(k);
+        if (it == impl.end()) return;
+        for (auto idx : it->second) f(idx);
     }
 #endif
 };
@@ -103,7 +147,7 @@ struct JoinAlgorithm {
                     [&](const auto& key) {
                         using Tk = std::decay_t<decltype(key)>;
                         if constexpr (std::is_same_v<Tk, T>) {
-                            ht.insert(key, idx);   //store row id
+                            ht.emplace(key, idx);   //store row id
                         } else if constexpr (!std::is_same_v<Tk, std::monostate>) {
                             throw std::runtime_error("wrong type of field");
                         }
@@ -118,7 +162,7 @@ struct JoinAlgorithm {
                     [&](const auto& key) {
                         using Tk = std::decay_t<decltype(key)>;
                         if constexpr (std::is_same_v<Tk, T>) {
-                            ht.for_each(key, [&](size_t left_idx) {
+                            (void)ht.find(key, [&](size_t left_idx) {
                                 const auto& left_record = left[left_idx];
 
                                 std::vector<Data> out;
@@ -147,7 +191,7 @@ struct JoinAlgorithm {
                     [&](const auto& key) {
                         using Tk = std::decay_t<decltype(key)>;
                         if constexpr (std::is_same_v<Tk, T>) {
-                            ht.insert(key, idx);
+                            ht.emplace(key, idx);
                         } else if constexpr (!std::is_same_v<Tk, std::monostate>) {
                             throw std::runtime_error("wrong type of field");
                         }
@@ -162,7 +206,7 @@ struct JoinAlgorithm {
                     [&](const auto& key) {
                         using Tk = std::decay_t<decltype(key)>;
                         if constexpr (std::is_same_v<Tk, T>) {
-                            ht.for_each(key, [&](size_t right_idx) {
+                            (void)ht.find(key, [&](size_t right_idx) {
                                 const auto& right_record = right[right_idx];
 
                                 std::vector<Data> out;

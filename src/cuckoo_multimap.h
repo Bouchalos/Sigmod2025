@@ -27,7 +27,7 @@ public:
     //insert (key, value)
     //  If key already exists: append value to its vector
     //  Else: try cuckoo insert. If it loops too long, rehash/expand
-    void insert(const K& key, const V& value) {
+    void emplace(const K& key, const V& value) {
         //fast path: key already present in one of its two homes?
         {
             std::size_t i1 = h1(key);
@@ -108,6 +108,29 @@ public:
         }
         //if not found no calls
     }
+
+
+template <class Fn>
+bool find(const K& key, Fn&& fn) const {
+    std::size_t i1 = h1(key);
+    if (table1_[i1].occupied && table1_[i1].key == key) {
+        for (const V& v : table1_[i1].vals)
+            fn(v);
+        return true;
+    }
+
+    std::size_t i2 = h2(key);
+    if (table2_[i2].occupied && table2_[i2].key == key) {
+        for (const V& v : table2_[i2].vals)
+            fn(v);
+        return true;
+    }
+
+    //if not found
+    return false;
+}
+
+
 
     std::size_t size()     const { return size_;     } //number of distinct keys (not total values)
     std::size_t capacity() const { return capacity_; } //slots per table
