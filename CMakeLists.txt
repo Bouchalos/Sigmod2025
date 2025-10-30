@@ -109,6 +109,37 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_include_directories(fast PRIVATE include)
 endif()
 
+# ============================================================
+# === Επιπλέον εκτελέσιμα fast_<backend> για HashJoin backends ===
+# ============================================================
+
+# Ίδιοι sources με το fast
+set(FAST_SRC ${SIGMODPC_SRC} tests/read_sql.cpp)
+
+add_executable(fast_robin   ${FAST_SRC})
+add_executable(fast_hop     ${FAST_SRC})
+add_executable(fast_cuckoo  ${FAST_SRC})
+add_executable(fast_std     ${FAST_SRC})
+
+# Ίδιες βιβλιοθήκες & include dirs
+target_link_libraries(fast_robin  PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+target_link_libraries(fast_hop    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+target_link_libraries(fast_cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+target_link_libraries(fast_std    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+
+target_include_directories(fast_robin  PRIVATE include)
+target_include_directories(fast_hop    PRIVATE include)
+target_include_directories(fast_cuckoo PRIVATE include)
+target_include_directories(fast_std    PRIVATE include)
+
+# Μακροεντολές για compile-time επιλογή
+target_compile_definitions(fast_robin  PRIVATE USE_ROBIN)
+target_compile_definitions(fast_hop    PRIVATE USE_HOP)
+target_compile_definitions(fast_cuckoo PRIVATE USE_CUCKOO)
+target_compile_definitions(fast_std    PRIVATE USE_STD)
+
+
+
 target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
 target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB)
 target_link_libraries(build_database PRIVATE fmt duckdb)

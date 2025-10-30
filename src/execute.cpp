@@ -1,9 +1,8 @@
 #include <hardware.h>
 #include <plan.h>
 #include <table.h>
-//#include "HopscotchHash.h"
-#include "RobinHoodHash.h"
-//#include  "cuckoo_multimap.h"
+#include "macro.h"
+
 
 namespace Contest {
 
@@ -23,7 +22,7 @@ struct JoinAlgorithm {
     auto run() {
         namespace views = ranges::views;
         size_t expected = build_left ? left.size() : right.size();  //function to take the expected elements we are going to add
-        RobinHoodHashMap<T, std::vector<size_t>> hash_table(expected);
+        HashTable<T> hash_table(expected);
         if (build_left) {
             for (auto&& [idx, record]: left | views::enumerate) {
                 std::visit(
