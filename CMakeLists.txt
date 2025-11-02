@@ -138,6 +138,14 @@ target_compile_definitions(fast_hop    PRIVATE USE_HOP)
 target_compile_definitions(fast_cuckoo PRIVATE USE_CUCKOO)
 target_compile_definitions(fast_std    PRIVATE USE_STD)
 
+add_executable(test_cuckoo tests/test_cuckoo.cpp)
+target_link_libraries(test_cuckoo PRIVATE 
+re2 range-v3 fmt
+nlohmann_json::nlohmann_json
+sqlparser
+Catch2::Catch2WithMain)
+target_include_directories(test_cuckoo PRIVATE src)
+
 add_executable(test_robinhood tests/test_robinhood.cpp)
 target_link_libraries(test_robinhood PRIVATE Catch2::Catch2WithMain)
 target_include_directories(test_robinhood PRIVATE src)
@@ -152,7 +160,3 @@ target_link_libraries(unit_tests PRIVATE re2 range-v3 fmt Catch2::Catch2WithMain
 target_include_directories(run PRIVATE include)
 target_include_directories(build_database PRIVATE include)
 target_include_directories(unit_tests PRIVATE include)
-
-
-
-

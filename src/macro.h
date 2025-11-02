@@ -13,13 +13,13 @@
   using HashTable = HopscotchHashMap<K, std::vector<std::size_t>>;
 
 #elif defined(USE_CUCKOO)
-  #include "cuckoo_multimap.h"
+  #include "CuckooHash.h"
   template <class K>
   using HashTable = cuckoo::CuckooMultiMap<K, std::vector<std::size_t>>;
 
 #elif defined(USE_STD)
   #include <unordered_map>
-  // Τυπική STL υλοποίηση hash map
+  //Standard STL hash map implementation
   template <class K>
   using HashTable = std::unordered_map<K, std::vector<std::size_t>>;
 
