@@ -132,13 +132,9 @@ public:
 
         size_t base = hash(key);    //takes the positiion that is going to be emplaced
 
-        auto it = find(key);     
-        if (it != end()) {      //if the key already exists 
-            if constexpr (is_same_v<Value, vector<typename Value::value_type>>) {   
-                it->second.insert(it->second.end(), value.begin(), value.end());    //MIGHT REMOVE
-            } else {
-                it->second = value;     //we reset the value 
-            }
+        auto it = find(key);
+        if (it != end()) {
+            it->second = value;     // overwrite always
             return {it, false};
         }
 

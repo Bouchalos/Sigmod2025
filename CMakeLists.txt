@@ -150,7 +150,9 @@ add_executable(test_robinhood tests/test_robinhood.cpp)
 target_link_libraries(test_robinhood PRIVATE Catch2::Catch2WithMain)
 target_include_directories(test_robinhood PRIVATE src)
 
-
+add_executable(test_hopscotch tests/test_hopscotch.cpp)
+target_link_libraries(test_hopscotch PRIVATE Catch2::Catch2WithMain)
+target_include_directories(test_hopscotch PRIVATE src)
 
 target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
 target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB)
