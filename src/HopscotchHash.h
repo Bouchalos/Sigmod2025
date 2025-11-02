@@ -167,7 +167,7 @@ public:
                     size_t new_dist = (free_idx + table_size - origin) % table_size;    //checks the distance of the origin of element we check
 
                     if (new_dist < neighborhood_size) {     //if the free position is in it's neighborhood
-                        table[free_idx].kv = move(table[idx].kv);   //we move the elemnt there
+                        table[free_idx].kv = std::move(table[idx].kv);   //we move the elemnt there
                         bitmap_reset(origin, dist);   //reset the bitmap of the origin
                         bitmap_set(origin, new_dist); //set the bitmap
                         table[idx].kv.reset();  //free the bucket
