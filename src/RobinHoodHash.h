@@ -102,6 +102,15 @@ public:
         size_t idx = hash(key);
         size_t dist = 0;
 
+        while (table[idx].kv && table[idx].distance >= dist) {      //udate existing key
+        if (table[idx].kv->first == key) {
+            table[idx].kv->second = value;
+            return { iterator(table.begin() + idx, table.end()), false };
+        }
+        idx = (idx + 1) % table_size;
+        ++dist;
+    }
+
         Key cur_key = key;
         Value cur_val = value;
 
