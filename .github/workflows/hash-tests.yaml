@@ -24,12 +24,12 @@ jobs:
 
       - name: Run Hopscotch tests
         run: |
-          cd build && (ctest --output-on-failure -R hopscotch || ./test_hopscotch || true)
+          cd build && ./test_hopscotch
 
       - name: Run RobinHood tests
         run: |
-          cd build && (ctest --output-on-failure -R robinhood || ./test_robinhood || true)
+          cd build && ./test_robinhood
 
       - name: Run Cuckoo tests
         run: |
-          cd build && (ctest --output-on-failure -R cuckoo || ./test_cuckoo || true)
+          cd build && ./test_cuckoo
