@@ -17,9 +17,10 @@ jobs:
         run: |
           cmake -S . -B build
 
-      - name: Build all tests
+      - name: Build only selected test targets
         run: |
-          cmake --build build -j$(nproc)
+          cmake --build build --target test_hopscotch test_robinhood test_cuckoo -j$(nproc)
+
 
       - name: Run Hopscotch tests
         run: |
