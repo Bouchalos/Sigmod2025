@@ -138,6 +138,11 @@ public:
             return {it, false};
         }
 
+        if (table[base].bitmap.all()) {     //checks the bitmap
+            rehash();
+            return emplace(key, value);
+        }
+
         size_t free_idx = base; 
         size_t scanned = 0; //how many buckets we checked
         while (table[free_idx].kv.has_value()) {    //while the bucket is not empty we go to next one
