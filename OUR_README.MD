@@ -50,6 +50,8 @@ cmake -S . -B build
 Δημιουργεί μια execute με καθένα από αυτά τα hashtables
 cmake --build build --target fast_robin fast_hop fast_cuckoo fast_std -- -j 6
 
+
+
 Για να τρέξουμε τα queries:
 ./build/fast_robin   plans.json
 ./build/fast_hop     plans.json
