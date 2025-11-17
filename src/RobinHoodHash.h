@@ -81,6 +81,11 @@ public:
         bool operator!=(const iterator& other) const { return it != other.it; } // ^^-
     };
 
+    iterator begin() {
+        return iterator(table.begin(), table.end());
+    }
+
+
     iterator end() { return iterator(table.end(), table.end()); }       //returns an iterator to end of table
 
     iterator find(const Key &key){
