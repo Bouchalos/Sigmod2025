@@ -3,7 +3,8 @@ on: [push, pull_request]
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: 
+      group: k23a
 
     steps:
       - uses: actions/checkout@v4
