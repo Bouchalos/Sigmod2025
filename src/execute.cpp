@@ -11,6 +11,7 @@
 #include <memory>
 
 
+
 struct StringIndex {
     uint64_t table_id : 6;
     uint64_t col_id   : 6;
