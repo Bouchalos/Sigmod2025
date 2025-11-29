@@ -8,6 +8,8 @@
 #include <vector>
 #include <variant>
 #include <cmath>
+#include <memory>
+
 
 struct StringIndex {
     uint64_t table_id : 6;
@@ -42,7 +44,41 @@ struct value_t {
 
 namespace Contest {
 
-using ExecuteResult = std::vector<std::vector<value_t>>;
+constexpr size_t CHUNK_SIZE = 4096;
+
+struct PagedColumn {
+    
+    std::vector<std::unique_ptr<value_t[]>> pages;
+    size_t total_size = 0;
+    size_t capacity = 0;
+
+   
+    void append(value_t val) {
+        if (total_size == capacity) {
+            pages.emplace_back(std::make_unique<value_t[]>(CHUNK_SIZE));
+            capacity += CHUNK_SIZE;
+        }
+        
+       
+        size_t page_idx = pages.size() - 1;
+        size_t offset = total_size % CHUNK_SIZE;
+        
+        pages[page_idx][offset] = val;
+        total_size++;
+    }
+
+ 
+    inline value_t get(size_t idx) const {
+        size_t page_idx = idx / CHUNK_SIZE; 
+        size_t offset   = idx % CHUNK_SIZE; 
+        return pages[page_idx][offset];
+    }
+
+    size_t size() const { return total_size; }
+};
+
+
+using ExecuteResult = std::vector<PagedColumn>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
@@ -121,6 +157,7 @@ struct ColumnCursor {
             }
 
             if (type == DataType::VARCHAR && num_rows_in_page == 0xFFFF) {
+                uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
                 StringIndex idx;
                 idx.table_id = table_id;
                 idx.col_id   = col_id;
@@ -131,7 +168,7 @@ struct ColumnCursor {
                 advance_page(); 
                 return value_t(idx);
             }
-            
+
             if (current_row_in_page >= num_rows_in_page) {
                 advance_page();
                 continue; 
@@ -159,6 +196,7 @@ struct ColumnCursor {
                 
                 uint64_t base_delta = reinterpret_cast<const uint8_t*>(chars_base_ptr) - page_data;
                 uint32_t final_offset = static_cast<uint32_t>(base_delta) + static_cast<uint32_t>(start_offset);
+
                 if (final_offset + len > PAGE_SIZE) {
                     advance_page();
                     continue; 
@@ -179,6 +217,7 @@ struct ColumnCursor {
     }
 };
 
+
 struct JoinAlgorithm {
     bool                                             build_left;
     ExecuteResult&                                   left;
@@ -192,14 +231,21 @@ struct JoinAlgorithm {
         
         auto& build_rel = build_left ? left : right;
         auto& probe_rel = build_left ? right : left;
-        size_t build_idx = build_left ? left_col : right_col;
-        size_t probe_idx = build_left ? right_col : left_col;
+        size_t build_col_idx = build_left ? left_col : right_col;
+        size_t probe_col_idx = build_left ? right_col : left_col;
 
-        HashTable<JoinType> hash_table(build_rel.size());
+      
+        results.resize(output_attrs.size());
 
-        for (size_t i = 0; i < build_rel.size(); ++i) {
-            const auto& row = build_rel[i];
-            const auto& key_val = row[build_idx];
+       
+        size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
+        size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
+
+        HashTable<JoinType> hash_table(build_rows);
+
+     
+        for (size_t i = 0; i < build_rows; ++i) {
+            value_t key_val = build_rel[build_col_idx].get(i);
             
             if (!key_val.is_null()) {
                 JoinType key = key_val.int_val;
@@ -212,11 +258,9 @@ struct JoinAlgorithm {
             }
         }
 
-        results.reserve(probe_rel.size());
-
-        for (size_t i = 0; i < probe_rel.size(); ++i) {
-            const auto& row = probe_rel[i];
-            const auto& key_val = row[probe_idx];
+      
+        for (size_t i = 0; i < probe_rows; ++i) {
+            value_t key_val = probe_rel[probe_col_idx].get(i);
 
             if (!key_val.is_null()) {
                 JoinType key = key_val.int_val;
@@ -224,22 +268,30 @@ struct JoinAlgorithm {
                 
                 if (itr != hash_table.end()) {
                     for (size_t match_idx : itr->second) {
-                        const auto& build_row = build_rel[match_idx];
+                       
                         
-                        const auto& l_row = build_left ? build_row : row;
-                        const auto& r_row = build_left ? row : build_row;
+                        size_t left_row_idx  = build_left ? match_idx : i;
+                        size_t right_row_idx = build_left ? i : match_idx;
 
-                        std::vector<value_t> new_row;
-                        new_row.reserve(output_attrs.size());
-
-                        for (auto [col, _] : output_attrs) {
-                            if (col < l_row.size()) {
-                                new_row.push_back(l_row[col]);
+                        
+                        for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
+                            auto [src_col_idx, _] = output_attrs[out_idx];
+                            
+                         
+                            
+                            size_t left_cols_count = left.size();
+                            
+                            value_t val_to_append;
+                            if (src_col_idx < left_cols_count) {
+                                
+                                val_to_append = left[src_col_idx].get(left_row_idx);
                             } else {
-                                new_row.push_back(r_row[col - l_row.size()]);
+                                
+                                val_to_append = right[src_col_idx - left_cols_count].get(right_row_idx);
                             }
+                            
+                            results[out_idx].append(val_to_append);
                         }
-                        results.push_back(std::move(new_row));
                     }
                 }
             }
@@ -253,7 +305,8 @@ ExecuteResult execute_hash_join(const Plan& plan,
     
     auto left_res  = execute_impl(plan, join.left);
     auto right_res = execute_impl(plan, join.right);
-    ExecuteResult results;
+    
+    ExecuteResult results; 
 
     JoinAlgorithm algo{
         .build_left   = join.build_left,
@@ -277,23 +330,24 @@ ExecuteResult execute_scan(const Plan& plan,
     const auto& input_table = plan.inputs[table_id];
     size_t total_rows = input_table.num_rows;
 
-    std::vector<ColumnCursor> cursors;
-    cursors.reserve(output_attrs.size());
-    for (auto [col_idx, type] : output_attrs) {
-        cursors.emplace_back(input_table, table_id, col_idx, type);
-    }
-
+    
     ExecuteResult results;
-    results.reserve(total_rows);
+    results.resize(output_attrs.size());
 
-    for (size_t i = 0; i < total_rows; ++i) {
-        std::vector<value_t> row;
-        row.reserve(output_attrs.size());
-        for (auto& cur : cursors) {
-            row.push_back(cur.next());
+   
+   
+    for (size_t i = 0; i < output_attrs.size(); ++i) {
+        auto [col_in_idx, type] = output_attrs[i];
+        
+        
+        ColumnCursor cur(input_table, table_id, col_in_idx, type);
+        
+        
+        for (size_t r = 0; r < total_rows; ++r) {
+            results[i].append(cur.next());
         }
-        results.push_back(std::move(row));
     }
+    
     return results;
 }
 
@@ -311,7 +365,7 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
         node.data);
 }
 
-// --- MATERIALIZE ---
+
 Data materialize(const value_t& val, const Plan& plan) {
     if (val.type == value_t::INT32) {
         return val.int_val;
@@ -330,60 +384,58 @@ Data materialize(const value_t& val, const Plan& plan) {
         const uint8_t* page_data = reinterpret_cast<const uint8_t*>(col.pages[idx.page_id]->data);
         uint16_t header = *reinterpret_cast<const uint16_t*>(page_data);
 
-        
+      
         if (header == 0xFFFF) {
             std::string full_string;
             uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
-            if (chunk_len > PAGE_SIZE) chunk_len = 0; // Safety
-            
+            if (chunk_len > PAGE_SIZE) chunk_len = 0;
             full_string.append(reinterpret_cast<const char*>(page_data + 4), chunk_len);
             
             size_t next_page_idx = idx.page_id + 1;
             while (next_page_idx < col.pages.size()) {
                 const uint8_t* next_page_data = reinterpret_cast<const uint8_t*>(col.pages[next_page_idx]->data);
                 uint16_t next_header = *reinterpret_cast<const uint16_t*>(next_page_data);
-                
                 if (next_header != 0xFFFE) break; 
-                
                 uint16_t next_chunk_len = *reinterpret_cast<const uint16_t*>(next_page_data + 2);
                 if (next_chunk_len > PAGE_SIZE) break;
-
                 full_string.append(reinterpret_cast<const char*>(next_page_data + 4), next_chunk_len);
                 next_page_idx++;
             }
-            
-            if (!full_string.empty() && full_string.back() == '\0') {
-                full_string.pop_back();
-            }
+            if (!full_string.empty() && full_string.back() == '\0') full_string.pop_back();
             return full_string;
         }
 
+        
         if (idx.offset + idx.length > PAGE_SIZE) return std::string("");
-
         const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
         size_t len = idx.length;
-        
-        if (len > 0 && ptr[len - 1] == '\0') {
-            return std::string(ptr, len - 1);
-        }
+        if (len > 0 && ptr[len - 1] == '\0') return std::string(ptr, len - 1);
         return std::string(ptr, len);
     }
     return std::monostate{};
 }
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
-    auto ret = execute_impl(plan, plan.root);
+    
+    auto columns = execute_impl(plan, plan.root);
+
+    
+    size_t num_rows = columns.empty() ? 0 : columns[0].size();
+    size_t num_cols = columns.size();
 
     std::vector<std::vector<Data>> old_style_ret;
-    old_style_ret.reserve(ret.size());
+    old_style_ret.reserve(num_rows);
 
-    for(const auto& row : ret) {
-        std::vector<Data> old_row;
-        old_row.reserve(row.size());
-        for(const auto& val : row) {
-            old_row.push_back(materialize(val, plan));
+    for(size_t i = 0; i < num_rows; ++i) {
+        std::vector<Data> row;
+        row.reserve(num_cols);
+        
+        for(size_t j = 0; j < num_cols; ++j) {
+           
+            value_t val = columns[j].get(i);
+            row.push_back(materialize(val, plan));
         }
-        old_style_ret.push_back(std::move(old_row));
+        old_style_ret.push_back(std::move(row));
     }
 
     namespace views = ranges::views;
