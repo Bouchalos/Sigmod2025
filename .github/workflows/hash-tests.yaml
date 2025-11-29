@@ -9,10 +9,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          apt update
-          apt install -y cmake g++ make
 
       - name: Configure project
         run: |
