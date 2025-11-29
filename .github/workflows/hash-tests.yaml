@@ -2,7 +2,7 @@ name: run-tests
 on: [push, pull_request]
 
 jobs:
-  build-test:
+  build-and-test:
     runs-on: 
       group: k23a
 
