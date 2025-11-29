@@ -11,8 +11,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y cmake g++ make
+          apt update
+          apt install -y cmake g++ make
 
       - name: Configure project
         run: |
