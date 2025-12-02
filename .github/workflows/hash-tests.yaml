@@ -2,16 +2,13 @@ name: run-tests
 on: [push, pull_request]
 
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
+  build-and-test:
+    runs-on: 
+      group: k23a
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake g++ make
 
       - name: Configure project
         run: |
