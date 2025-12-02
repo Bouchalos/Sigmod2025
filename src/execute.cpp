@@ -16,7 +16,7 @@ struct StringIndex {
     uint64_t table_id : 6;
     uint64_t col_id   : 6;
     uint64_t page_id  : 16; 
-    uint64_t offset   : 18; 
+    uint64_t offset   : 20; 
     uint64_t length   : 16; 
 };
 
