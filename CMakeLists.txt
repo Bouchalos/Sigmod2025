@@ -91,6 +91,23 @@ add_executable(run ${SIGMODPC_SRC} tests/read_sql.cpp)
 add_executable(unit_tests ${SIGMODPC_SRC} tests/unit_tests.cpp)
 add_executable(build_database tests/build_database.cpp)
 
+set(TEST_SOURCES ${SIGMODPC_SRC})
+
+list(FILTER TEST_SOURCES EXCLUDE REGEX "execute\.cpp$")
+
+add_executable(test_column_store tests/test_column_store.cpp ${TEST_SOURCES})
+
+target_link_libraries(test_column_store PRIVATE 
+    Catch2::Catch2WithMain 
+    re2 
+    fmt 
+    range-v3 
+    nlohmann_json::nlohmann_json 
+    sqlparser
+)
+
+target_include_directories(test_column_store PRIVATE include src)
+
 # For all executables
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_compile_definitions(run PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -109,34 +126,34 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_include_directories(fast PRIVATE include)
 endif()
 
-# ============================================================
-# === Επιπλέον εκτελέσιμα fast_<backend> για HashJoin backends ===
-# ============================================================
-
-# Ίδιοι sources με το fast
 set(FAST_SRC ${SIGMODPC_SRC} tests/read_sql.cpp)
 
 add_executable(fast_robin   ${FAST_SRC})
 add_executable(fast_hop     ${FAST_SRC})
 add_executable(fast_cuckoo  ${FAST_SRC})
 add_executable(fast_std     ${FAST_SRC})
+add_executable(fast_unc     ${FAST_SRC})
 
 # Ίδιες βιβλιοθήκες & include dirs
 target_link_libraries(fast_robin  PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
 target_link_libraries(fast_hop    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
 target_link_libraries(fast_cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
 target_link_libraries(fast_std    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+target_link_libraries(fast_unc    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+
 
 target_include_directories(fast_robin  PRIVATE include)
 target_include_directories(fast_hop    PRIVATE include)
 target_include_directories(fast_cuckoo PRIVATE include)
 target_include_directories(fast_std    PRIVATE include)
+target_include_directories(fast_unc    PRIVATE include)
 
 # Μακροεντολές για compile-time επιλογή
 target_compile_definitions(fast_robin  PRIVATE USE_ROBIN)
 target_compile_definitions(fast_hop    PRIVATE USE_HOP)
 target_compile_definitions(fast_cuckoo PRIVATE USE_CUCKOO)
 target_compile_definitions(fast_std    PRIVATE USE_STD)
+target_compile_definitions(fast_unc    PRIVATE USE_UNC)
 
 add_executable(test_cuckoo tests/test_cuckoo.cpp)
 target_link_libraries(test_cuckoo PRIVATE 
@@ -153,6 +170,10 @@ target_include_directories(test_robinhood PRIVATE src)
 add_executable(test_hopscotch tests/test_hopscotch.cpp)
 target_link_libraries(test_hopscotch PRIVATE Catch2::Catch2WithMain)
 target_include_directories(test_hopscotch PRIVATE src)
+
+add_executable(test_unchained tests/test_unchained.cpp)
+target_link_libraries(test_unchained PRIVATE Catch2::Catch2WithMain)
+target_include_directories(test_unchained PRIVATE src)
 
 target_link_libraries(run PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser duckdb)
 target_compile_definitions(run PRIVATE TEAMOPT_USE_DUCKDB)

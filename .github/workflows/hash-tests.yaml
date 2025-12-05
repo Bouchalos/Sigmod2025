@@ -16,7 +16,7 @@ jobs:
 
       - name: Build only selected test targets
         run: |
-          cmake --build build --target test_hopscotch test_robinhood test_cuckoo -j$(nproc)
+          cmake --build build --target test_hopscotch test_robinhood test_cuckoo test_column_store -j$(nproc)
 
 
       - name: Run Hopscotch tests
@@ -30,3 +30,7 @@ jobs:
       - name: Run Cuckoo tests
         run: |
           cd build && ./test_cuckoo
+
+          - name: Run columnar and materialize tests
+        run: |
+          cd build && ./test_column_store
