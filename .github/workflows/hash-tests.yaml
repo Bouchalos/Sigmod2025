@@ -31,6 +31,6 @@ jobs:
         run: |
           cd build && ./test_cuckoo
 
-          - name: Run columnar and materialize tests
+      - name: Run columnar and materialize tests
         run: |
           cd build && ./test_column_store
