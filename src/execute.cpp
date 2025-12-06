@@ -42,10 +42,9 @@ struct value_t {
         return true;
     }
 };
-
 namespace Contest {
 
-constexpr size_t CHUNK_SIZE = 4096;
+constexpr size_t CHUNK_SIZE = 1024;
 
 struct PagedColumn {
     
@@ -244,59 +243,44 @@ struct JoinAlgorithm {
 
         HashTable<JoinType> hash_table(build_rows);
 
-     
-        for (size_t i = 0; i < build_rows; ++i) {
+        for (size_t i = 0; i < build_rows; ++i) {       //adds key and value to tuple
             value_t key_val = build_rel[build_col_idx].get(i);
             
             if (!key_val.is_null()) {
                 JoinType key = key_val.int_val;
-                auto itr = hash_table.find(key);
-                if (itr == hash_table.end()) {
-                    hash_table.emplace(key, std::vector<size_t>{i});
-                } else {
-                    itr->second.push_back(i);
-                }
+
+                hash_table.add_tuple(key, {i});
+
             }
         }
-
-      
+        hash_table.build();
         for (size_t i = 0; i < probe_rows; ++i) {
             value_t key_val = probe_rel[probe_col_idx].get(i);
-
             if (!key_val.is_null()) {
                 JoinType key = key_val.int_val;
-                auto itr = hash_table.find(key);
-                
-                if (itr != hash_table.end()) {
-                    for (size_t match_idx : itr->second) {
-                       
-                        
+                auto match_vectors = hash_table.find(key);      //find returns a vector that contains every value that key matches
+                for (auto* vec_ptr : match_vectors) {
+                    std::vector<size_t>& vec = *vec_ptr;
+                    for (size_t match_idx : vec) {
                         size_t left_row_idx  = build_left ? match_idx : i;
                         size_t right_row_idx = build_left ? i : match_idx;
-
-                        
                         for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
                             auto [src_col_idx, _] = output_attrs[out_idx];
-                            
-                         
-                            
                             size_t left_cols_count = left.size();
-                            
                             value_t val_to_append;
                             if (src_col_idx < left_cols_count) {
-                                
                                 val_to_append = left[src_col_idx].get(left_row_idx);
                             } else {
-                                
                                 val_to_append = right[src_col_idx - left_cols_count].get(right_row_idx);
                             }
-                            
+
                             results[out_idx].append(val_to_append);
                         }
                     }
                 }
             }
         }
+
     }
 };
 
