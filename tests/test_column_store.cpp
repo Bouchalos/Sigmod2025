@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <iostream>
 #include <vector>
-#define USE_ROBIN
+#define USE_UNC
 #include "../src/macro.h"
 #include "../src/execute.cpp"
 
