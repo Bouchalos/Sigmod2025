@@ -3,7 +3,7 @@
 #include <vector>
 #include <string>
 
-TEST_CASE("UnchainedHashTable basic insert/find operations", "[insert][find]") {
+TEST_CASE("UnchainedHashTable basic insert/find operations", "[insert][find]") {//insert and find check
     UnchainedHashTable<int, int> table(8);
 
     table.add_tuple(1, 100);
@@ -29,7 +29,7 @@ TEST_CASE("UnchainedHashTable basic insert/find operations", "[insert][find]") {
     REQUIRE(v4.empty());
 }
 
-TEST_CASE("UnchainedHashTable handles duplicate keys", "[insert][duplicate]") {
+TEST_CASE("UnchainedHashTable handles duplicate keys", "[insert][duplicate]") { //returns both vals check
     UnchainedHashTable<int, std::vector<size_t>> table(8);
 
     table.add_tuple(1, {10});
@@ -47,7 +47,7 @@ TEST_CASE("UnchainedHashTable handles duplicate keys", "[insert][duplicate]") {
     REQUIRE(vec3.empty());
 }
 
-TEST_CASE("UnchainedHashTable bloom filter rejects missing keys", "[bloom]") {
+TEST_CASE("UnchainedHashTable bloom filter rejects missing keys", "[bloom]") {  //bloom filters check
     UnchainedHashTable<int, int> table(4);
 
     table.add_tuple(4, 999);
@@ -61,7 +61,7 @@ TEST_CASE("UnchainedHashTable bloom filter rejects missing keys", "[bloom]") {
     REQUIRE(*present[0] == 999);
 }
 
-TEST_CASE("UnchainedHashTable empty table behavior", "[empty]") {
+TEST_CASE("UnchainedHashTable empty table behavior", "[empty]") {   
     UnchainedHashTable<int, int> table(0);
     table.build();
 
@@ -69,20 +69,20 @@ TEST_CASE("UnchainedHashTable empty table behavior", "[empty]") {
     REQUIRE(table.find(12345).empty());
 }
 
-TEST_CASE("UnchainedHashTable large number of elements", "[stress][large]") {
-    UnchainedHashTable<int, int> table(1000);
+TEST_CASE("UnchainedHashTable large number of elements", "[stress][large]") {   //stress test
+    UnchainedHashTable<int, int> table(100000);
 
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100000; ++i) {
         table.add_tuple(i, i * 10);
     }
     table.build();
 
-    for (int i = 0; i < 1000; ++i) {
+    for (int i = 0; i < 100000; ++i) {
         auto val = table.find(i);
         REQUIRE(val.size() == 1);
         REQUIRE(*val[0] == i * 10);
     }
 
-    auto missing = table.find(1001);
+    auto missing = table.find(100001);
     REQUIRE(missing.empty());
 }
