@@ -2,16 +2,13 @@ name: run-tests
 on: [push, pull_request]
 
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
+  build-and-test:
+    runs-on: 
+      group: k23a
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y cmake g++ make
 
       - name: Configure project
         run: |
@@ -19,7 +16,7 @@ jobs:
 
       - name: Build only selected test targets
         run: |
-          cmake --build build --target test_hopscotch test_robinhood test_cuckoo -j$(nproc)
+          cmake --build build --target test_hopscotch test_robinhood test_cuckoo test_column_store test_unchained -j$(nproc)
 
 
       - name: Run Hopscotch tests
@@ -33,3 +30,11 @@ jobs:
       - name: Run Cuckoo tests
         run: |
           cd build && ./test_cuckoo
+
+      - name: Run columnar and materialize tests
+        run: |
+          cd build && ./test_column_store
+
+      - name: Run unchained tests
+        run: |
+          cd build && ./test_unchained

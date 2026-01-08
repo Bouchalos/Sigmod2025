@@ -36,16 +36,10 @@ private:
     vector<Bucket> table;   //a table of buckets
     size_t table_size;      //the size of the table
     size_t element_count;   //the total elements I have in the table
-    size_t neighborhood_size;   //the size of the neighborhood
+    static constexpr size_t neighborhood_size = 32;   //the size of the neighborhood
 
     size_t hash(const Key& key) const {         //the hash function
         return std::hash<Key>{}(key) % table_size;
-    }
-
-    void recompute_neighborhood() {     //function to find the neighborhood size 
-        size_t n = 1;
-        while ((1ULL << n) < table_size && n < MAX_BITS) ++n;  //Finds the neighborhood to be around log2 of the table size, if I have a huge table the size caps at 64 
-        neighborhood_size = clamp(n, (size_t)1 , MAX_BITS);  //Sets the neighborhood around 1 - 64 if it overflowed these nums
     }
 
     void bitmap_set(size_t base, size_t offset) {     //sets the bit of the position that has been captured by the same key
@@ -80,7 +74,6 @@ private:
         table.resize(new_size);     //sets the new size
         table_size = new_size;
         element_count = 0;
-        recompute_neighborhood();   //sizes up the neighborhood 
 
         for (auto& [k, v] : old_pairs)     // add all the elements back to the new table 
             emplace(k, v);
@@ -88,11 +81,10 @@ private:
 
 public:
     HopscotchHashMap(size_t expected_elements = 64)     //takes an expected amount of elements
-        : table_size(0), element_count(0), neighborhood_size(0) {   
+        : table_size(0), element_count(0) {   
         if (expected_elements < 1) expected_elements = 1;   //check so the table will be at least 1 size
         table_size = next_prime(expected_elements * 2);     //finds the next prime of the double of elements that going to be inserted
         table.resize(table_size);   //sets the table size
-        recompute_neighborhood();      //sets the neighborhood size
     }
 
     struct iterator {
@@ -127,7 +119,6 @@ public:
         if (table_size == 0) {
             table_size = next_prime(2);
             table.resize(table_size);
-            recompute_neighborhood();
         }
 
         size_t base = hash(key);    //takes the positiion that is going to be emplaced

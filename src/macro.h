@@ -19,9 +19,13 @@
 
 #elif defined(USE_STD)
   #include <unordered_map>
-  //Standard STL hash map implementation
   template <class K>
   using HashTable = std::unordered_map<K, std::vector<std::size_t>>;
+
+  #elif defined(USE_UNC)
+  #include "UnchainedHash.h"
+  template <class K>
+  using HashTable = UnchainedHashTable<K, std::vector<std::size_t>>;
 
 #else
   #error "Define one of: USE_ROBIN, USE_HOP, USE_CUCKOO, USE_STD"
