@@ -92,7 +92,7 @@ inline bool get_bitmap_at(const uint8_t* bitmap, uint16_t idx) {
 constexpr size_t GLOBAL_CHUNK_SIZE = 2 * 1024 * 1024; 
 constexpr size_t PARTITION_BITS = 10;
 constexpr size_t NUM_PARTITIONS = 1 << PARTITION_BITS;
-constexpr size_t JOB_BATCH_SIZE = 4096; // Work Stealing Batch Size
+constexpr size_t JOB_BATCH_SIZE = 4096; 
 
 struct BuildTuple {
     uint64_t hash;
@@ -188,7 +188,6 @@ struct JoinAlgorithm {
         GlobalAllocator global_alloc;
         std::vector<std::unique_ptr<ThreadLocalAllocator>> thread_allocs(num_threads);
 
-        // --- PHASE 1: PARTITIONING (Work Stealing) ---
         std::atomic<size_t> partition_counter{0};
         
         auto partition_task = [&](size_t t_id) {
@@ -219,7 +218,6 @@ struct JoinAlgorithm {
         for (auto& t : threads) t.join();
         threads.clear();
 
-        // --- PHASE 2: HISTOGRAM (Work Stealing on Partitions) ---
         std::atomic<size_t> hist_counter{0};
         
         auto count_task = [&](size_t t_id) {
@@ -247,7 +245,6 @@ struct JoinAlgorithm {
         for (auto& t : threads) t.join();
         threads.clear();
 
-        // --- PHASE 3: PREFIX SUM ---
         uint32_t total_count = 0;
         for (size_t i = 0; i < directory.size(); ++i) {
             uint32_t count = directory[i] >> 32;
@@ -256,7 +253,6 @@ struct JoinAlgorithm {
         }
         tuple_storage = std::make_unique<BuildTuple[]>(total_count);
 
-        // --- PHASE 4: SCATTER (Work Stealing on Partitions) ---
         std::atomic<size_t> scatter_counter{0};
         
         auto scatter_task = [&](size_t t_id) {
@@ -291,7 +287,6 @@ struct JoinAlgorithm {
         for (auto& t : threads) t.join();
         threads.clear();
 
-        // Restore Offsets
         uint64_t prev_entry = 0; 
         for (size_t i = 0; i < directory.size(); ++i) {
             uint64_t current_val = directory[i];
@@ -301,7 +296,6 @@ struct JoinAlgorithm {
             prev_entry = current_val; 
         }
 
-        // --- PHASE 5: PARALLEL PROBE (Work Stealing) ---
         std::vector<std::vector<std::vector<value_t>>> thread_results(num_threads);
         for(auto& res : thread_results) res.resize(output_attrs.size());
         
@@ -310,7 +304,6 @@ struct JoinAlgorithm {
 
         auto probe_task = [&](size_t t_id) {
             auto& local_res = thread_results[t_id];
-            // Pre-allocation heuristic
             for(auto& vec : local_res) vec.reserve(JOB_BATCH_SIZE); 
 
             while (true) {
@@ -362,7 +355,6 @@ struct JoinAlgorithm {
         }
         for (auto& t : threads) t.join();
 
-        // --- PHASE 6: AGGREGATE ---
         for (size_t t = 0; t < num_threads; ++t) {
             for (size_t col = 0; col < output_attrs.size(); ++col) {
                 for (const auto& val : thread_results[t][col]) {
