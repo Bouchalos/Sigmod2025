@@ -155,6 +155,15 @@ target_compile_definitions(fast_cuckoo PRIVATE USE_CUCKOO)
 target_compile_definitions(fast_std    PRIVATE USE_STD)
 target_compile_definitions(fast_unc    PRIVATE USE_UNC)
 
+add_executable(leaderboard ${FAST_SRC})
+
+target_link_libraries(leaderboard PRIVATE
+    re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser
+)
+
+target_include_directories(leaderboard PRIVATE include)
+target_compile_definitions(leaderboard PRIVATE USE_UNC)
+
 add_executable(test_cuckoo tests/test_cuckoo.cpp)
 target_link_libraries(test_cuckoo PRIVATE 
 re2 range-v3 fmt
