@@ -21,7 +21,7 @@ jobs:
 
       - name: Build project
         run: |
-          cmake --build build -- -j$(nproc) leaderboard
+          cmake --build build --target fast_unc -- -j 6 
           
       - name: Run for leaderboard
         run: |
