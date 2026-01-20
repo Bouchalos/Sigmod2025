@@ -56,16 +56,22 @@ struct PagedColumn {
     std::vector<const int32_t*> view_chunks;
     uint32_t view_rows_per_page = 0;
 
-    void append(value_t val) {
+    void append(const value_t& val) {
         if (total_size == capacity) {
             pages.emplace_back(std::make_unique<value_t[]>(CHUNK_SIZE));
             capacity += CHUNK_SIZE;
         }
         size_t page_idx = pages.size() - 1;
         size_t offset = total_size % CHUNK_SIZE;
-        pages[page_idx][offset] = val;
+
+        if (val.type == value_t::VARCHAR) {
+            pages[page_idx][offset] = val; 
+        } else {
+            pages[page_idx][offset] = val;
+        }
         total_size++;
     }
+
 
     inline value_t get(size_t idx) const {
         if (is_view) {
@@ -218,72 +224,6 @@ struct ColumnCursor {
         }
     }
 };
-
-constexpr size_t GLOBAL_CHUNK_SIZE = 2 * 1024 * 1024; 
-constexpr size_t PARTITION_BITS = 10;
-constexpr size_t NUM_PARTITIONS = 1 << PARTITION_BITS;
-constexpr size_t JOB_BATCH_SIZE = 4096; // Work Stealing Batch Size
-
-struct BuildTuple {
-    uint64_t hash;
-    int32_t  key;
-    uint32_t row_id;
-};
-
-class GlobalAllocator {
-    std::vector<void*> pools;
-    std::mutex mtx;
-public:
-    ~GlobalAllocator() { for (void* p : pools) std::free(p); }
-    void* allocate() {
-        void* ptr = std::malloc(GLOBAL_CHUNK_SIZE);
-        std::lock_guard<std::mutex> lock(mtx);
-        pools.push_back(ptr);
-        return ptr;
-    }
-};
-
-struct PartitionBuffer {
-    struct Chunk {
-        Chunk* next = nullptr;
-        uint8_t data[]; 
-    };
-    Chunk* head = nullptr;
-    Chunk* active = nullptr;
-    size_t offset = 0;
-    
-    void add_tuple(const BuildTuple& t, GlobalAllocator& global) {
-        constexpr size_t T_SIZE = sizeof(BuildTuple);
-        constexpr size_t HEADER_SIZE = sizeof(Chunk);
-
-        if (!active || offset + T_SIZE > GLOBAL_CHUNK_SIZE - HEADER_SIZE) {
-            Chunk* new_chunk = static_cast<Chunk*>(global.allocate());
-            new_chunk->next = head;
-            head = new_chunk;
-            active = new_chunk;
-            offset = 0;
-        }
-        std::memcpy(active->data + offset, &t, T_SIZE);
-        offset += T_SIZE;
-    }
-};
-
-struct ThreadLocalAllocator {
-    std::vector<PartitionBuffer> partitions;
-    ThreadLocalAllocator() : partitions(NUM_PARTITIONS) {}
-};
-
-inline uint64_t next_pow2(uint64_t x) {
-    if (x == 0) return 1;
-    x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; x |= x >> 32;
-    return ++x;
-}
-
-inline uint64_t hash_key(int32_t key) {
-    uint64_t h = _mm_crc32_u32(0, (uint32_t)key);
-    h ^= (h << 32); 
-    return h;
-}
 
 struct JoinAlgorithm {
     bool                                             build_left;
