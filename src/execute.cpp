@@ -10,6 +10,11 @@
 #include <cmath>
 #include <memory>
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <array>
+#include <nmmintrin.h> 
 
 struct StringIndex {
     uint64_t table_id : 6;
@@ -31,15 +36,6 @@ struct value_t {
     value_t(StringIndex s) : type(VARCHAR), str_index(s) {}
 
     bool is_null() const { return type == NULL_VAL; }
-
-    bool operator==(const value_t& other) const {
-        if (type != other.type) return false;
-        if (type == INT32) return int_val == other.int_val;
-        if (type == VARCHAR) {
-            return std::memcmp(&str_index, &other.str_index, sizeof(StringIndex)) == 0;
-        }
-        return true;
-    }
 };
 
 namespace Contest {
@@ -65,10 +61,8 @@ struct PagedColumn {
             pages.emplace_back(std::make_unique<value_t[]>(CHUNK_SIZE));
             capacity += CHUNK_SIZE;
         }
-        
         size_t page_idx = pages.size() - 1;
         size_t offset = total_size % CHUNK_SIZE;
-        
         pages[page_idx][offset] = val;
         total_size++;
     }
@@ -79,7 +73,6 @@ struct PagedColumn {
             size_t offset   = idx % view_rows_per_page;
             return value_t(view_chunks[page_idx][offset]);
         }
-
         size_t page_idx = idx / CHUNK_SIZE; 
         size_t offset   = idx % CHUNK_SIZE; 
         return pages[page_idx][offset];
@@ -225,6 +218,72 @@ struct ColumnCursor {
         }
     }
 };
+
+constexpr size_t GLOBAL_CHUNK_SIZE = 2 * 1024 * 1024; 
+constexpr size_t PARTITION_BITS = 10;
+constexpr size_t NUM_PARTITIONS = 1 << PARTITION_BITS;
+constexpr size_t JOB_BATCH_SIZE = 4096; // Work Stealing Batch Size
+
+struct BuildTuple {
+    uint64_t hash;
+    int32_t  key;
+    uint32_t row_id;
+};
+
+class GlobalAllocator {
+    std::vector<void*> pools;
+    std::mutex mtx;
+public:
+    ~GlobalAllocator() { for (void* p : pools) std::free(p); }
+    void* allocate() {
+        void* ptr = std::malloc(GLOBAL_CHUNK_SIZE);
+        std::lock_guard<std::mutex> lock(mtx);
+        pools.push_back(ptr);
+        return ptr;
+    }
+};
+
+struct PartitionBuffer {
+    struct Chunk {
+        Chunk* next = nullptr;
+        uint8_t data[]; 
+    };
+    Chunk* head = nullptr;
+    Chunk* active = nullptr;
+    size_t offset = 0;
+    
+    void add_tuple(const BuildTuple& t, GlobalAllocator& global) {
+        constexpr size_t T_SIZE = sizeof(BuildTuple);
+        constexpr size_t HEADER_SIZE = sizeof(Chunk);
+
+        if (!active || offset + T_SIZE > GLOBAL_CHUNK_SIZE - HEADER_SIZE) {
+            Chunk* new_chunk = static_cast<Chunk*>(global.allocate());
+            new_chunk->next = head;
+            head = new_chunk;
+            active = new_chunk;
+            offset = 0;
+        }
+        std::memcpy(active->data + offset, &t, T_SIZE);
+        offset += T_SIZE;
+    }
+};
+
+struct ThreadLocalAllocator {
+    std::vector<PartitionBuffer> partitions;
+    ThreadLocalAllocator() : partitions(NUM_PARTITIONS) {}
+};
+
+inline uint64_t next_pow2(uint64_t x) {
+    if (x == 0) return 1;
+    x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; x |= x >> 32;
+    return ++x;
+}
+
+inline uint64_t hash_key(int32_t key) {
+    uint64_t h = _mm_crc32_u32(0, (uint32_t)key);
+    h ^= (h << 32); 
+    return h;
+}
 
 struct JoinAlgorithm {
     bool                                             build_left;
@@ -378,80 +437,87 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
         node.data);
 }
 
-Data materialize(const value_t& val, const Plan& plan) {
-    if (val.type == value_t::INT32) {
-        return val.int_val;
-    }
-    if (val.is_null()) {
-        return std::monostate{};
-    }
-    if (val.type == value_t::VARCHAR) {
-        StringIndex idx = val.str_index;
-        
-        if (idx.table_id >= plan.inputs.size()) return std::monostate{};
-        const auto& table = plan.inputs[idx.table_id];
-        const auto& col = table.columns[idx.col_id];
-        if (idx.page_id >= col.pages.size()) return std::monostate{};
-        
-        const uint8_t* page_data = reinterpret_cast<const uint8_t*>(col.pages[idx.page_id]->data);
-        uint16_t header = *reinterpret_cast<const uint16_t*>(page_data);
+std::string materialize_string(const value_t& val, const Plan& plan) {
+    StringIndex idx = val.str_index;
+    if (idx.table_id >= plan.inputs.size()) return "";
+    const auto& col = plan.inputs[idx.table_id].columns[idx.col_id];
+    if (idx.page_id >= col.pages.size()) return "";
+    
+    const uint8_t* page_data = reinterpret_cast<const uint8_t*>(col.pages[idx.page_id]->data);
+    uint16_t header = *reinterpret_cast<const uint16_t*>(page_data);
 
-        if (header == 0xFFFF) {
-            std::string full_string;
-            uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
-            if (chunk_len > PAGE_SIZE) chunk_len = 0;
-            full_string.append(reinterpret_cast<const char*>(page_data + 4), chunk_len);
-            
-            size_t next_page_idx = idx.page_id + 1;
-            while (next_page_idx < col.pages.size()) {
-                const uint8_t* next_page_data = reinterpret_cast<const uint8_t*>(col.pages[next_page_idx]->data);
-                uint16_t next_header = *reinterpret_cast<const uint16_t*>(next_page_data);
-                if (next_header != 0xFFFE) break; 
-                uint16_t next_chunk_len = *reinterpret_cast<const uint16_t*>(next_page_data + 2);
-                if (next_chunk_len > PAGE_SIZE) break;
-                full_string.append(reinterpret_cast<const char*>(next_page_data + 4), next_chunk_len);
-                next_page_idx++;
-            }
-            if (!full_string.empty() && full_string.back() == '\0') full_string.pop_back();
-            return full_string;
-        }
+    if (header == 0xFFFF) {
+        std::string full_string;
+        uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
+        if (chunk_len > PAGE_SIZE) chunk_len = 0;
+        full_string.append(reinterpret_cast<const char*>(page_data + 4), chunk_len);
         
-        if (idx.offset + idx.length > PAGE_SIZE) return std::string("");
-        const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
-        size_t len = idx.length;
-        if (len > 0 && ptr[len - 1] == '\0') return std::string(ptr, len - 1);
-        return std::string(ptr, len);
+        size_t next_page_idx = idx.page_id + 1;
+        while (next_page_idx < col.pages.size()) {
+            const uint8_t* next_page_data = reinterpret_cast<const uint8_t*>(col.pages[next_page_idx]->data);
+            uint16_t next_header = *reinterpret_cast<const uint16_t*>(next_page_data);
+            if (next_header != 0xFFFE) break; 
+            uint16_t next_chunk_len = *reinterpret_cast<const uint16_t*>(next_page_data + 2);
+            if (next_chunk_len > PAGE_SIZE) break;
+            full_string.append(reinterpret_cast<const char*>(next_page_data + 4), next_chunk_len);
+            next_page_idx++;
+        }
+        if (!full_string.empty() && full_string.back() == '\0') full_string.pop_back();
+        return full_string;
     }
-    return std::monostate{};
+    
+    if (idx.offset + idx.length > PAGE_SIZE) return "";
+    const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
+    size_t len = idx.length;
+    if (len > 0 && ptr[len - 1] == '\0') return std::string(ptr, len - 1);
+    return std::string(ptr, len);
 }
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     auto columns = execute_impl(plan, plan.root);
-
+    
     size_t num_rows = columns.empty() ? 0 : columns[0].size();
     size_t num_cols = columns.size();
 
-    std::vector<std::vector<Data>> old_style_ret;
-    old_style_ret.reserve(num_rows);
+    ColumnarTable output_table;
+    output_table.num_rows = num_rows;
 
-    for(size_t i = 0; i < num_rows; ++i) {
-        std::vector<Data> row;
-        row.reserve(num_cols);
-        
-        for(size_t j = 0; j < num_cols; ++j) {
-            value_t val = columns[j].get(i);
-            row.push_back(materialize(val, plan));
+    for(size_t j = 0; j < num_cols; ++j) {
+        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
+        Column out_col(type);
+
+        if (type == DataType::INT32) {
+            ColumnInserter<int32_t> inserter(out_col);
+            for (size_t i = 0; i < num_rows; ++i) {
+                value_t val = columns[j].get(i);
+                if (val.is_null()) inserter.insert_null();
+                else inserter.insert(val.int_val);
+            }
+            inserter.finalize();
+        } 
+        else if (type == DataType::VARCHAR) {
+            ColumnInserter<std::string> inserter(out_col);
+            for (size_t i = 0; i < num_rows; ++i) {
+                value_t val = columns[j].get(i);
+                if (val.is_null()) inserter.insert_null();
+                else {
+                    std::string s = materialize_string(val, plan);
+                    inserter.insert(s);
+                }
+            }
+            inserter.finalize();
+        } else if (type == DataType::INT64) {
+             ColumnInserter<int64_t> inserter(out_col);
+             inserter.finalize();
+        } else if (type == DataType::FP64) {
+             ColumnInserter<double> inserter(out_col);
+             inserter.finalize();
         }
-        old_style_ret.push_back(std::move(row));
+        
+        output_table.columns.push_back(std::move(out_col));
     }
 
-    namespace views = ranges::views;
-    auto ret_types  = plan.nodes[plan.root].output_attrs
-                   | views::transform([](const auto& v) { return std::get<1>(v); })
-                   | ranges::to<std::vector<DataType>>();
-    
-    Table table{std::move(old_style_ret), std::move(ret_types)};
-    return table.to_columnar();
+    return output_table;
 }
 
 void* build_context() { return nullptr; }
