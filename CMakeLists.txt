@@ -57,6 +57,8 @@ FetchContent_Declare(
     URL https://github.com/fmtlib/fmt/releases/download/11.1.3/fmt-11.1.3.zip
 )
 
+find_package(OpenMP REQUIRED)
+
 FetchContent_MakeAvailable(fmtlib)
 
 FetchContent_Declare(
@@ -139,7 +141,7 @@ target_link_libraries(fast_robin  PRIVATE re2 fmt range-v3 nlohmann_json::nlohma
 target_link_libraries(fast_hop    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
 target_link_libraries(fast_cuckoo PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
 target_link_libraries(fast_std    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
-target_link_libraries(fast_unc    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser)
+target_link_libraries(fast_unc    PRIVATE re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser OpenMP::OpenMP_CXX)
 
 
 target_include_directories(fast_robin  PRIVATE include)
@@ -154,22 +156,24 @@ target_compile_definitions(fast_hop    PRIVATE USE_HOP)
 target_compile_definitions(fast_cuckoo PRIVATE USE_CUCKOO)
 target_compile_definitions(fast_std    PRIVATE USE_STD)
 target_compile_definitions(fast_unc    PRIVATE USE_UNC)
+target_compile_options(fast_unc PRIVATE ${OpenMP_CXX_FLAGS})
 
 add_executable(leaderboard ${FAST_SRC})
 
 target_link_libraries(leaderboard PRIVATE
-    re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser
+    re2 fmt range-v3 nlohmann_json::nlohmann_json sqlparser OpenMP::OpenMP_CXX
 )
 
 target_include_directories(leaderboard PRIVATE include)
 target_compile_definitions(leaderboard PRIVATE USE_UNC)
+target_compile_options(leaderboard PRIVATE ${OpenMP_CXX_FLAGS})
 
 add_executable(test_cuckoo tests/test_cuckoo.cpp)
 target_link_libraries(test_cuckoo PRIVATE 
 re2 range-v3 fmt
 nlohmann_json::nlohmann_json
 sqlparser
-Catch2::Catch2WithMain)
+Catch2::Catch2WithMain OpenMP::OpenMP_CXX)
 target_include_directories(test_cuckoo PRIVATE src)
 
 add_executable(test_robinhood tests/test_robinhood.cpp)
