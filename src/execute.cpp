@@ -415,46 +415,63 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     auto columns = execute_impl(plan, plan.root);
-    
     size_t num_rows = columns.empty() ? 0 : columns[0].size();
     size_t num_cols = columns.size();
 
     ColumnarTable output_table;
     output_table.num_rows = num_rows;
 
-    for(size_t j = 0; j < num_cols; ++j) {
-        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
-        Column out_col(type);
+    std::vector<std::optional<Column>> tmp_columns(num_cols);
 
-        if (type == DataType::INT32) {
-            ColumnInserter<int32_t> inserter(out_col);
-            for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = columns[j].get(i);
-                if (val.is_null()) inserter.insert_null();
-                else inserter.insert(val.int_val);
-            }
-            inserter.finalize();
-        } 
-        else if (type == DataType::VARCHAR) {
-            ColumnInserter<std::string> inserter(out_col);
-            for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = columns[j].get(i);
-                if (val.is_null()) inserter.insert_null();
-                else {
-                    std::string s = materialize_string(val, plan);
-                    inserter.insert(s);
+    size_t num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+
+    std::vector<std::thread> threads;
+    auto worker = [&](size_t begin, size_t end) {
+        for (size_t j = begin; j < end; ++j) {
+            auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
+            Column out_col(type);
+            if (type == DataType::INT32) {
+                ColumnInserter<int32_t> inserter(out_col);
+                for (size_t i = 0; i < num_rows; ++i) {
+                    value_t val = columns[j].get(i);
+                    if (val.is_null()) inserter.insert_null();
+                    else inserter.insert(val.int_val);
                 }
+                inserter.finalize();
             }
-            inserter.finalize();
-        } else if (type == DataType::INT64) {
-             ColumnInserter<int64_t> inserter(out_col);
-             inserter.finalize();
-        } else if (type == DataType::FP64) {
-             ColumnInserter<double> inserter(out_col);
-             inserter.finalize();
+            else if (type == DataType::VARCHAR) {
+                ColumnInserter<std::string> inserter(out_col);
+                for (size_t i = 0; i < num_rows; ++i) {
+                    value_t val = columns[j].get(i);
+                    if (val.is_null()) inserter.insert_null();
+                    else {
+                        std::string s = materialize_string(val, plan);
+                        inserter.insert(s);
+                    }
+                }
+                inserter.finalize();
+            }
+
+            tmp_columns[j].emplace(std::move(out_col));
         }
-        
-        output_table.columns.push_back(std::move(out_col));
+    };
+
+    size_t cols_per_thread = (num_cols + num_threads - 1) / num_threads;
+
+    for (size_t t = 0; t < num_threads; ++t) {
+        size_t begin = t * cols_per_thread;
+        size_t end   = std::min(begin + cols_per_thread, num_cols);
+        if (begin < end) {
+            threads.emplace_back(worker, begin, end);
+        }
+    }
+
+    for (auto& th : threads) th.join();
+
+    output_table.columns.reserve(num_cols);
+    for (size_t j = 0; j < num_cols; ++j) {
+        output_table.columns.push_back(std::move(*tmp_columns[j]));
     }
 
     return output_table;
