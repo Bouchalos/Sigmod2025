@@ -249,109 +249,135 @@ struct JoinAlgorithm {
     const std::vector<std::tuple<size_t, DataType>>& output_attrs;
 
     void run() {
-    using JoinType = int32_t;
-    using TableTuple = typename UnchainedHashTable<JoinType, size_t>::Tuple;
+        using JoinType   = int32_t;
+        using TableTuple = typename UnchainedHashTable<JoinType, size_t>::Tuple;
 
-    auto& build_rel = build_left ? left : right;
-    auto& probe_rel = build_left ? right : left;
-    size_t build_col_idx = build_left ? left_col : right_col;
-    size_t probe_col_idx = build_left ? right_col : left_col;
+        auto& build_rel = build_left ? left : right;
+        auto& probe_rel = build_left ? right : left;
 
-    results.resize(output_attrs.size());
+        size_t build_col_idx = build_left ? left_col  : right_col;
+        size_t probe_col_idx = build_left ? right_col : left_col;
 
-    size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
-    size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
+        results.resize(output_attrs.size());
 
-    const size_t numPartitions = 32;
-    PartitionAlloc level3[numPartitions]; 
-    UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
+        size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
+        size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-    // 1. BUILD PHASE με Mutexes ανά Partition
-    std::mutex part_mutexes[numPartitions];
-omp_set_num_threads(numPartitions); 
+        constexpr size_t numPartitions = 32;
+
+        PartitionAlloc level3[numPartitions];
+        std::mutex part_mutexes[numPartitions];
+
+        /* ============================================================
+         * 1. BUILD PHASE (same logic, better hashing)
+         * ============================================================ */
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < build_rows; ++i) {
+            value_t key_val = build_rel[build_col_idx].get(i);
+            if (key_val.is_null()) continue;
+
+            JoinType key = key_val.int_val;
+            uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+            size_t part  = h & (numPartitions - 1);
+
+            std::lock_guard<std::mutex> lock(part_mutexes[part]);
+
+            if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                Chunk* c   = new Chunk();
+                c->data     = new uint8_t[SMALL_CHUNK_SIZE];
+                c->capacity = SMALL_CHUNK_SIZE;
+                level3[part].addSpace(c);
+            }
+
+            TableTuple* t = level3[part].allocate<TableTuple>();
+            t->key   = key;
+            t->value = i;
+        }
+
+        /* ============================================================
+         * 2. BUILD HASH TABLE
+         * ============================================================ */
+        UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
+        hash_table.build_from_slabs(level3, numPartitions);
+
+        /* ============================================================
+         * 3. PRECOMPUTE OUTPUT ACCESSORS
+         * ============================================================ */
+        struct OutputAccessor {
+            bool   from_left;
+            size_t col;
+        };
+
+        std::vector<OutputAccessor> accessors;
+        accessors.reserve(output_attrs.size());
+
+        for (auto [idx, _] : output_attrs) {
+            if (idx < left.size())
+                accessors.push_back({true, idx});
+            else
+                accessors.push_back({false, idx - left.size()});
+        }
+
+        /* ============================================================
+         * 4. PROBE PHASE
+         * ============================================================ */
+        std::atomic<size_t> global_row_idx(0);
+        constexpr size_t grain_size = 1024;
+
+        int num_threads = omp_get_max_threads();
+        std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
 
 #pragma omp parallel
-{
-    int tid = omp_get_thread_num(); // Το ID του thread (0-63)
-    
-    // Κάθε thread μπορεί να αρχικοποιήσει το δικό του partition αν χρειαστεί
-    // ή να επεξεργαστεί ένα κομμάτι των build_rows
-    #pragma omp for
-    for (size_t i = 0; i < build_rows; ++i) {
-        value_t key_val = build_rel[build_col_idx].get(i);
-        if (key_val.is_null()) continue;
-        
-        JoinType key = key_val.int_val;
-        uint64_t h = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-        size_t part = h >> (64 - 6); 
+        {
+            int tid = omp_get_thread_num();
+            auto& local = all_thread_results[tid];
+            local.resize(accessors.size());
 
-        // Εδώ το κλείδωμα παραμένει γιατί το thread 5 μπορεί να βρει 
-        // κλειδί που ανήκει στο partition 10.
-        std::lock_guard<std::mutex> lock(part_mutexes[part]);
-        
-        if (level3[part].freeSpace() < sizeof(TableTuple)) {
-            Chunk* c = new Chunk(); 
-            c->data = new uint8_t[SMALL_CHUNK_SIZE];
-            c->capacity = SMALL_CHUNK_SIZE;
-            level3[part].addSpace(c);
-        }
-        TableTuple* t = level3[part].template allocate<TableTuple>();
-        t->key = key; t->value = i; 
-    }
-}
+            while (true) {
+                size_t start = global_row_idx.fetch_add(grain_size);
+                if (start >= probe_rows) break;
+                size_t end = std::min(start + grain_size, probe_rows);
 
-    // 2. BUILD HASH TABLE (Single Thread)
-    hash_table.build_from_slabs(level3, numPartitions);
+                for (size_t i = start; i < end; ++i) {
+                    value_t key_val = probe_rel[probe_col_idx].get(i);
+                    if (key_val.is_null()) continue;
 
-    std::atomic<size_t> global_row_idx(0);
-    const size_t grain_size = 1024; 
-    int num_threads = omp_get_max_threads();
-    // Container για να κρατήσουμε τα local_results όλων των threads
-    std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
+                    auto matches = hash_table.find(key_val.int_val);
 
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        all_thread_results[tid].resize(output_attrs.size());
-        
-        while (true) {
-            size_t start_idx = global_row_idx.fetch_add(grain_size);
-            if (start_idx >= probe_rows) break;
-            size_t end_idx = std::min(start_idx + grain_size, probe_rows);
+                    for (size_t* match_ptr : matches) {
+                        size_t match_idx = *match_ptr;
 
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                value_t key_val = probe_rel[probe_col_idx].get(i);
-                if (key_val.is_null()) continue;
+                        size_t left_row  = build_left ? match_idx : i;
+                        size_t right_row = build_left ? i         : match_idx;
 
-                auto matches = hash_table.find(key_val.int_val); 
-                for (size_t* match_idx_ptr : matches) {
-                    size_t match_idx = *match_idx_ptr;
-                    size_t left_row_idx  = build_left ? match_idx : i;
-                    size_t right_row_idx = build_left ? i : match_idx;
+                        for (size_t out = 0; out < accessors.size(); ++out) {
+                            const auto& acc = accessors[out];
+                            value_t v = acc.from_left
+                                ? left [acc.col].get(left_row)
+                                : right[acc.col].get(right_row);
 
-                    for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-                        auto [src_col_idx, _] = output_attrs[out_idx];
-                        value_t val = (src_col_idx < left.size()) ? 
-                                       left[src_col_idx].get(left_row_idx) : 
-                                       right[src_col_idx - left.size()].get(right_row_idx);
-                        all_thread_results[tid][out_idx].push_back(val);
+                            local[out].push_back(v);
+                        }
                     }
                 }
             }
         }
-    } // Τέλος Parallel Block - Εδώ τα threads πεθαίνουν/σταματούν
-    // 5. SINGLE-THREADED AGGREGATION (Εκτελείται από το master thread)
-    for (int t = 0; t < num_threads; ++t) {
-        if (all_thread_results[t].empty() || all_thread_results[t][0].empty()) continue;
-        
-        for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
-            for (const auto& val : all_thread_results[t][out_idx]) {
-                results[out_idx].append(val);
+
+        /* ============================================================
+         * 5. FINAL AGGREGATION
+         * ============================================================ */
+        for (int t = 0; t < num_threads; ++t) {
+            for (size_t out = 0; out < accessors.size(); ++out) {
+                for (auto& v : all_thread_results[t][out]) {
+                    results[out].append(v);
+                }
             }
         }
     }
-}
 };
+
+
+
 
 ExecuteResult execute_hash_join(const Plan& plan,
     const JoinNode& join,
