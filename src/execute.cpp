@@ -406,55 +406,71 @@ ExecuteResult execute_hash_join(const Plan& plan,
 ExecuteResult execute_scan(const Plan& plan,
                            const ScanNode& scan,
                            const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
-    
-    auto table_id = scan.base_table_id;
-    const auto& input_table = plan.inputs[table_id];
-    size_t total_rows = input_table.num_rows;
-    
+
+    const auto table_id    = scan.base_table_id;
+    const auto& table      = plan.inputs[table_id];
+    const size_t total_rows = table.num_rows;
+
     ExecuteResult results;
     results.resize(output_attrs.size());
 
-    for (size_t i = 0; i < output_attrs.size(); ++i) {
-        auto [col_in_idx, type] = output_attrs[i];
-        
-        bool can_optimize = (type == DataType::INT32);
-        
-        if (can_optimize) {
-            for (auto* page : input_table.columns[col_in_idx].pages) {
-                auto* header = reinterpret_cast<const PageHeader*>(page->data);
+    for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
+        const auto [col_idx, type] = output_attrs[out_idx];
+        auto& out_col = results[out_idx];
+        const auto& in_col = table.columns[col_idx];
+
+        /* ============================================================
+         * FAST PATH: INT32 full pages → zero-copy view
+         * ============================================================ */
+        if (type == DataType::INT32 && !in_col.pages.empty()) {
+            bool can_view = true;
+            uint32_t rows_per_page = 0;
+
+            // single pass validation
+            for (auto* page : in_col.pages) {
+                const auto* header =
+                    reinterpret_cast<const PageHeader*>(page->data);
+
                 if (header->num_rows != header->val_count) {
-                    can_optimize = false;
+                    can_view = false;
                     break;
                 }
+
+                if (rows_per_page == 0)
+                    rows_per_page = header->num_rows;
+            }
+
+            if (can_view) {
+                out_col.is_view = true;
+                out_col.total_size = total_rows;
+                out_col.view_rows_per_page = rows_per_page;
+                out_col.view_chunks.reserve(in_col.pages.size());
+
+                for (auto* page : in_col.pages) {
+                    const auto* raw =
+                        reinterpret_cast<const int32_t*>(
+                            reinterpret_cast<const uint8_t*>(page->data)
+                            + sizeof(PageHeader)
+                        );
+                    out_col.view_chunks.push_back(raw);
+                }
+                continue; // ⬅ skip slow path
             }
         }
 
-        if (can_optimize) {
-            auto& col_res = results[i];
-            col_res.is_view = true;
-            col_res.total_size = total_rows;
-            
-            if (!input_table.columns[col_in_idx].pages.empty()) {
-                auto* header0 = reinterpret_cast<const PageHeader*>(input_table.columns[col_in_idx].pages[0]->data);
-                col_res.view_rows_per_page = header0->num_rows;
-            }
+        /* ============================================================
+         * SLOW PATH: generic scan
+         * ============================================================ */
+        ColumnCursor cursor(table, table_id, col_idx, type);
 
-            for (auto* page : input_table.columns[col_in_idx].pages) {
-                const int32_t* raw_data = reinterpret_cast<const int32_t*>(
-                    reinterpret_cast<const uint8_t*>(page->data) + 4
-                );
-                col_res.view_chunks.push_back(raw_data);
-            }
-        } else {
-            ColumnCursor cur(input_table, table_id, col_in_idx, type);
-            for (size_t r = 0; r < total_rows; ++r) {
-                results[i].append(cur.next());
-            }
+        for (size_t r = 0; r < total_rows; ++r) {
+            out_col.append(cursor.next());
         }
     }
-    
+
     return results;
 }
+
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
     auto& node = plan.nodes[node_idx];
