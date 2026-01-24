@@ -88,16 +88,19 @@ struct PagedColumn {
     }
 
 
-    inline value_t get(size_t idx) const {
-        if (is_view) {
-            size_t page_idx = idx / view_rows_per_page;
-            size_t offset   = idx % view_rows_per_page;
-            return value_t(view_chunks[page_idx][offset]);
-        }
-        size_t page_idx = idx / CHUNK_SIZE; 
-        size_t offset   = idx % CHUNK_SIZE; 
-        return pages[page_idx][offset];
+    inline value_t get(size_t idx) const noexcept {
+    if (is_view) {
+        const size_t page_idx = idx / view_rows_per_page;
+        const size_t offset   = idx % view_rows_per_page;
+        value_t v;
+        v.type = value_t::INT32;
+        v.int_val = view_chunks[page_idx][offset];
+        return v;
     }
+    const size_t page_idx = idx >> 10;          // /1024
+    const size_t offset   = idx & (CHUNK_SIZE-1);
+    return pages[page_idx][offset];
+}
 
     size_t size() const { return total_size; }
 };
