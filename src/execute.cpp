@@ -34,11 +34,11 @@ struct value_t {
         StringIndex str_index;
     };
 
-    value_t() : type(NULL_VAL), int_val(0) {}
-    value_t(int32_t v) : type(INT32), int_val(v) {}
-    value_t(StringIndex s) : type(VARCHAR), str_index(s) {}
+    inline value_t() noexcept : type(NULL_VAL), int_val(0) {}
+    inline value_t(int32_t v) noexcept : type(INT32), int_val(v) {}
+    inline value_t(const StringIndex& s) noexcept : type(VARCHAR), str_index(s) {}
 
-    bool is_null() const { return type == NULL_VAL; }
+    inline bool is_null() const noexcept { return type == NULL_VAL; }
 };
 
 namespace Contest {
@@ -102,6 +102,7 @@ struct PagedColumn {
     return pages[page_idx][offset];
 }
 
+
     size_t size() const { return total_size; }
 };
 
@@ -109,139 +110,143 @@ using ExecuteResult = std::vector<PagedColumn>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
-inline bool get_bitmap_at(const uint8_t* bitmap, uint16_t idx) {
-    return bitmap[idx / 8] & (1u << (idx % 8));
+inline bool get_bitmap_at(const uint8_t* __restrict bitmap, uint16_t idx) noexcept {
+    return bitmap[idx >> 3] & (1u << (idx & 7));
 }
+
 
 struct ColumnCursor {
     const Column* column_ptr;
-    size_t         page_idx;
+    size_t page_idx;
     const uint8_t* page_data;
-    uint16_t       num_rows_in_page;
-    uint16_t       current_row_in_page; 
-    uint16_t       non_null_idx; 
-    
-    uint16_t       table_id;
-    uint16_t       col_id;
-    DataType       type;
-    size_t         num_pages;
+
+    uint16_t num_rows_in_page;
+    uint16_t current_row;
+    uint16_t non_null_idx;
+
+    uint16_t table_id;
+    uint16_t col_id;
+    DataType type;
+    size_t num_pages;
 
     const uint8_t* bitmap_ptr;
-    const uint8_t* data_start_ptr; 
-    const uint16_t* offsets_ptr;    
-    const char* chars_base_ptr; 
+    const uint8_t* data_ptr;
+    const uint16_t* offsets_ptr;
+    const char* chars_ptr;
 
-    ColumnCursor(const ColumnarTable& table, size_t t_id, size_t c_id, DataType t) 
-        : column_ptr(&table.columns[c_id]), page_idx(0), 
-          table_id(t_id), col_id(c_id), type(t) {
-        
+    inline ColumnCursor(const ColumnarTable& table,
+                        uint16_t t_id,
+                        uint16_t c_id,
+                        DataType t) noexcept
+        : column_ptr(&table.columns[c_id]),
+          page_idx(0),
+          table_id(t_id),
+          col_id(c_id),
+          type(t) {
         num_pages = column_ptr->pages.size();
         load_page(0);
     }
 
-    void load_page(size_t idx) {
+    inline void load_page(size_t idx) noexcept {
         page_idx = idx;
-        current_row_in_page = 0;
+        current_row = 0;
         non_null_idx = 0;
 
-        if (page_idx < num_pages) {
-            page_data = reinterpret_cast<const uint8_t*>(column_ptr->pages[page_idx]->data);
-            num_rows_in_page = *reinterpret_cast<const uint16_t*>(page_data);
-            
-            if (type == DataType::VARCHAR && (num_rows_in_page == 0xFFFF || num_rows_in_page == 0xFFFE)) {
-                bitmap_ptr = nullptr;
-                offsets_ptr = nullptr;
-                return; 
-            }
-
-            size_t bitmap_size = (num_rows_in_page + 7) / 8;
-            bitmap_ptr = page_data + PAGE_SIZE - bitmap_size;
-
-            if (type == DataType::INT32) {
-                data_start_ptr = page_data + 4;
-            } else if (type == DataType::VARCHAR) {
-                uint16_t num_offsets = *reinterpret_cast<const uint16_t*>(page_data + 2);
-                offsets_ptr = reinterpret_cast<const uint16_t*>(page_data + 4);
-                chars_base_ptr = reinterpret_cast<const char*>(page_data + 4 + num_offsets * 2);
-            }
-        } else {
+        if (idx >= num_pages) {
             page_data = nullptr;
+            return;
+        }
+
+        page_data = reinterpret_cast<const uint8_t*>(column_ptr->pages[idx]->data);
+        num_rows_in_page = *reinterpret_cast<const uint16_t*>(page_data);
+
+        if (type == DataType::VARCHAR &&
+           (num_rows_in_page == 0xFFFF || num_rows_in_page == 0xFFFE)) {
+            bitmap_ptr = nullptr;
+            return;
+        }
+
+        bitmap_ptr = page_data + PAGE_SIZE - ((num_rows_in_page + 7) >> 3);
+
+        if (type == DataType::INT32) {
+            data_ptr = page_data + 4;
+        } else {
+            const uint16_t num_offsets = *reinterpret_cast<const uint16_t*>(page_data + 2);
+            offsets_ptr = reinterpret_cast<const uint16_t*>(page_data + 4);
+            chars_ptr   = reinterpret_cast<const char*>(page_data + 4 + num_offsets * 2);
         }
     }
 
-    void advance_page() {
+    inline void advance_page() noexcept {
         load_page(page_idx + 1);
     }
 
-    value_t next() {
-        while (true) { 
-            if (!page_data) return value_t(); 
+    inline value_t next() noexcept {
+        for (;;) {
+            if (!page_data) return value_t();
 
+            // continuation page
             if (type == DataType::VARCHAR && num_rows_in_page == 0xFFFE) {
                 advance_page();
                 continue;
             }
 
+            // long string start
             if (type == DataType::VARCHAR && num_rows_in_page == 0xFFFF) {
-                uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
-                StringIndex idx;
-                idx.table_id = table_id;
-                idx.col_id   = col_id;
-                idx.page_id  = page_idx; 
-                idx.offset   = 4; 
-                idx.length   = 0; 
-
-                advance_page(); 
-                return value_t(idx);
-            }
-
-            if (current_row_in_page >= num_rows_in_page) {
-                advance_page();
-                continue; 
-            }
-
-            bool is_valid = false;
-            if (bitmap_ptr) {
-                is_valid = get_bitmap_at(bitmap_ptr, current_row_in_page);
-            }
-            current_row_in_page++;
-
-            if (!is_valid) {
-                return value_t(); 
-            }
-
-            if (type == DataType::INT32) {
-                const int32_t* arr = reinterpret_cast<const int32_t*>(data_start_ptr);
-                int32_t val = arr[non_null_idx++];
-                return value_t(val);
-
-            } else if (type == DataType::VARCHAR) {
-                uint16_t end_offset = offsets_ptr[non_null_idx];
-                uint16_t start_offset = (non_null_idx == 0) ? 0 : offsets_ptr[non_null_idx - 1];
-                uint16_t len = end_offset - start_offset;
-                
-                uint64_t base_delta = reinterpret_cast<const uint8_t*>(chars_base_ptr) - page_data;
-                uint32_t final_offset = static_cast<uint32_t>(base_delta) + static_cast<uint32_t>(start_offset);
-
-                if (final_offset + len > PAGE_SIZE) {
-                    advance_page();
-                    continue; 
-                }
-
-                non_null_idx++;
-
                 StringIndex idx;
                 idx.table_id = table_id;
                 idx.col_id   = col_id;
                 idx.page_id  = page_idx;
-                idx.offset   = final_offset;
-                idx.length   = len;
-
+                idx.offset   = 4;
+                idx.length   = 0;
+                advance_page();
                 return value_t(idx);
             }
+
+            if (current_row >= num_rows_in_page) {
+                advance_page();
+                continue;
+            }
+
+            const bool valid = bitmap_ptr
+                ? get_bitmap_at(bitmap_ptr, current_row)
+                : true;
+
+            current_row++;
+
+            if (!valid) return value_t();
+
+            if (type == DataType::INT32) {
+                const int32_t* arr = reinterpret_cast<const int32_t*>(data_ptr);
+                return value_t(arr[non_null_idx++]);
+            }
+
+            // VARCHAR
+            const uint16_t end = offsets_ptr[non_null_idx];
+            const uint16_t start = (non_null_idx == 0) ? 0 : offsets_ptr[non_null_idx - 1];
+            const uint16_t len = end - start;
+
+            const uint32_t base =
+                static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(chars_ptr) - page_data);
+
+            if (base + start + len > PAGE_SIZE) {
+                advance_page();
+                continue;
+            }
+
+            StringIndex idx;
+            idx.table_id = table_id;
+            idx.col_id   = col_id;
+            idx.page_id  = page_idx;
+            idx.offset   = base + start;
+            idx.length   = len;
+
+            non_null_idx++;
+            return value_t(idx);
         }
     }
 };
+
 
 struct JoinAlgorithm {
     bool                                             build_left;
