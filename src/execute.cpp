@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 1024;
+constexpr size_t CHUNK_SIZE = 512;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
@@ -335,7 +335,7 @@ struct JoinAlgorithm {
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
     atomic<size_t> global_idx(0);  //atomic counter
-    constexpr size_t grain_size = 2048;     
+    constexpr size_t grain_size = 512;     
     int num_threads = omp_get_max_threads();
 
     vector<vector<vector<value_t>>> all_thread_results(num_threads);
