@@ -278,7 +278,7 @@ struct JoinAlgorithm {
 #   pragma omp parallel
     {
         vector<TableTuple> local_tuples;
-        local_tuples.reserve(1024);
+        local_tuples.reserve(2048);
 
 #   pragma omp for schedule(guided, chunk_size)     //collect tuples parallel
         for (size_t i = 0; i < build_rows; ++i) {
