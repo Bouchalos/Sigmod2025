@@ -452,19 +452,6 @@ ExecuteResult execute_scan(const Plan& plan,
     ExecuteResult results;
     results.resize(output_attrs.size());
 
-    // ---------------------------
-    // Dynamic thread count based on table size
-    // ---------------------------
-    int max_threads = omp_get_max_threads();
-    int num_threads = 1; // default single-threaded
-    if (total_rows > 4096) {
-        num_threads = std::min<int>(max_threads, (total_rows + 4095) / 4096);
-    }
-
-    // ---------------------------
-    // Parallel over columns
-    // ---------------------------
-#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
         const auto [col_idx, type] = output_attrs[out_idx];
         auto& out_col = results[out_idx];
@@ -477,13 +464,16 @@ ExecuteResult execute_scan(const Plan& plan,
             bool can_view = true;
             uint32_t rows_per_page = 0;
 
+            // single pass validation
             for (auto* page : in_col.pages) {
                 const auto* header =
                     reinterpret_cast<const PageHeader*>(page->data);
+
                 if (header->num_rows != header->val_count) {
                     can_view = false;
                     break;
                 }
+
                 if (rows_per_page == 0)
                     rows_per_page = header->num_rows;
             }
@@ -502,7 +492,7 @@ ExecuteResult execute_scan(const Plan& plan,
                         );
                     out_col.view_chunks.push_back(raw);
                 }
-                continue; // skip slow path
+                continue; // ⬅ skip slow path
             }
         }
 
@@ -511,19 +501,13 @@ ExecuteResult execute_scan(const Plan& plan,
          * ============================================================ */
         ColumnCursor cursor(table, table_id, col_idx, type);
 
-        // small-grain batching για καλύτερη παραλληλία σε μεγάλες στήλες
-        constexpr size_t grain_size = 4096;
-        for (size_t start = 0; start < total_rows; start += grain_size) {
-            size_t end = std::min(start + grain_size, total_rows);
-            for (size_t r = start; r < end; ++r) {
-                out_col.append(cursor.next());
-            }
+        for (size_t r = 0; r < total_rows; ++r) {
+            out_col.append(cursor.next());
         }
     }
 
     return results;
 }
-
 
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
@@ -638,15 +622,36 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
             inserter.finalize();
         } 
         else if (type == DataType::VARCHAR) {
-            ColumnInserter<std::string> inserter(dst);
-
-            for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = src.get(i);
-                if (val.is_null()) inserter.insert_null();
-                else inserter.insert(materialize_string(val, plan));
+    ColumnInserter<std::string> inserter(dst);
+    
+    // Προ-υπολογισμός αν πρόκειται για μεγάλο όγκο δεδομένων
+    for (size_t i = 0; i < num_rows; ++i) {
+        value_t val = src.get(i);
+        if (val.is_null()) {
+            inserter.insert_null();
+        } else {
+            // Αντί για materialize_string που φτιάχνει std::string object,
+            // γράψε απευθείας από τη μνήμη της πηγής.
+            StringIndex idx = val.str_index;
+            const auto& col_src = plan.inputs[idx.table_id].columns[idx.col_id];
+            const uint8_t* page_data = reinterpret_cast<const uint8_t*>(col_src.pages[idx.page_id]->data);
+            
+            // Fast path για απλά strings (όχι multi-page)
+            if (*reinterpret_cast<const uint16_t*>(page_data) != 0xFFFF) {
+                const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
+                size_t len = idx.length;
+                if (len > 0 && ptr[len - 1] == '\0') len--;
+                
+                // Χρήση string_view για να μην γίνει allocation πριν το insert
+                inserter.insert(std::string(ptr, len)); 
+            } else {
+                // Slow path για multi-page strings
+                inserter.insert(materialize_string(val, plan));
             }
-            inserter.finalize();
         }
+    }
+    inserter.finalize();
+}
     }
 
     return output_table;
