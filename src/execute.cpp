@@ -452,6 +452,19 @@ ExecuteResult execute_scan(const Plan& plan,
     ExecuteResult results;
     results.resize(output_attrs.size());
 
+    // ---------------------------
+    // Dynamic thread count based on table size
+    // ---------------------------
+    int max_threads = omp_get_max_threads();
+    int num_threads = 1; // default single-threaded
+    if (total_rows > 4096) {
+        num_threads = std::min<int>(max_threads, (total_rows + 4095) / 4096);
+    }
+
+    // ---------------------------
+    // Parallel over columns
+    // ---------------------------
+#pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for (size_t out_idx = 0; out_idx < output_attrs.size(); ++out_idx) {
         const auto [col_idx, type] = output_attrs[out_idx];
         auto& out_col = results[out_idx];
@@ -464,16 +477,13 @@ ExecuteResult execute_scan(const Plan& plan,
             bool can_view = true;
             uint32_t rows_per_page = 0;
 
-            // single pass validation
             for (auto* page : in_col.pages) {
                 const auto* header =
                     reinterpret_cast<const PageHeader*>(page->data);
-
                 if (header->num_rows != header->val_count) {
                     can_view = false;
                     break;
                 }
-
                 if (rows_per_page == 0)
                     rows_per_page = header->num_rows;
             }
@@ -492,7 +502,7 @@ ExecuteResult execute_scan(const Plan& plan,
                         );
                     out_col.view_chunks.push_back(raw);
                 }
-                continue; // ⬅ skip slow path
+                continue; // skip slow path
             }
         }
 
@@ -501,13 +511,19 @@ ExecuteResult execute_scan(const Plan& plan,
          * ============================================================ */
         ColumnCursor cursor(table, table_id, col_idx, type);
 
-        for (size_t r = 0; r < total_rows; ++r) {
-            out_col.append(cursor.next());
+        // small-grain batching για καλύτερη παραλληλία σε μεγάλες στήλες
+        constexpr size_t grain_size = 4096;
+        for (size_t start = 0; start < total_rows; start += grain_size) {
+            size_t end = std::min(start + grain_size, total_rows);
+            for (size_t r = start; r < end; ++r) {
+                out_col.append(cursor.next());
+            }
         }
     }
 
     return results;
 }
+
 
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
