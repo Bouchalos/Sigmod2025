@@ -248,14 +248,14 @@ public:
 }
 
 
-private:
-    void produceMatches(const K& key, size_t slot, std::vector<V*>& out) {  //finds the key and returns the values
-        size_t dir_n = directory.size();
-        uint64_t start = directory[slot] >> 16; //takes the 48 bits (offset) start of the adjency list
-        uint64_t end = (slot + 1 == dir_n) ? adjacency.size() : (directory[slot + 1] >> 16);    //end of the bucket
-        for (uint64_t i = start; i < end; ++i) {
-            Tuple& t = adjacency[i];
-            if (t.key == key) out.push_back(&t.value);
-        }
-    }
+// private:
+//     void produceMatches(const K& key, size_t slot, std::vector<V*>& out) {  //finds the key and returns the values
+//         size_t dir_n = directory.size();
+//         uint64_t start = directory[slot] >> 16; //takes the 48 bits (offset) start of the adjency list
+//         uint64_t end = (slot + 1 == dir_n) ? adjacency.size() : (directory[slot + 1] >> 16);    //end of the bucket
+//         for (uint64_t i = start; i < end; ++i) {
+//             Tuple& t = adjacency[i];
+//             if (t.key == key) out.push_back(&t.value);
+//         }
+//     }
 };

@@ -276,47 +276,33 @@ struct JoinAlgorithm {
     PartitionAlloc level3[numPartitions];
     std::mutex part_mutexes[numPartitions];
 
-    /* ============================================================
-     * 1. BUILD PHASE - thread-local allocation
-     * ============================================================ */
+int max_threads = omp_get_max_threads();
+int n = std::min<int>(max_threads, build_rows > 0 ? (build_rows + 4095) / 4096 : 1);
+
+// Υπολογισμός δυναμικού chunk_size
+size_t target_chunks_per_thread = 16;   // ρυθμίσιμο
+size_t min_chunk = 256;                 // δεν θέλουμε πολύ μικρά chunks
+size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thread));
+
 #pragma omp parallel
-    {
-        std::vector<TableTuple> local_tuples;
-        local_tuples.reserve(1024);
+{
+    std::vector<TableTuple> local_tuples;
+    local_tuples.reserve(4096);
 
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < build_rows; ++i) {
-            value_t key_val = build_rel[build_col_idx].get(i);
-            if (key_val.is_null()) continue;
+#pragma omp for schedule(guided, chunk_size)
+    for (size_t i = 0; i < build_rows; ++i) {
+        value_t key_val = build_rel[build_col_idx].get(i);
+        if (key_val.is_null()) continue;
 
-            JoinType key = key_val.int_val;
-            uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-            size_t part  = h & (numPartitions - 1);
+        JoinType key = key_val.int_val;
+        uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+        size_t part  = h & (numPartitions - 1);
 
-            TableTuple t{key, i};
-            local_tuples.push_back(t);
+        local_tuples.push_back({key, i});
 
-            if (local_tuples.size() >= 256) {
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
-                for (auto& tuple : local_tuples) {
-                    if (level3[part].freeSpace() < sizeof(TableTuple)) {
-                        Chunk* c = new Chunk();
-                        c->data = new uint8_t[SMALL_CHUNK_SIZE];
-                        c->capacity = SMALL_CHUNK_SIZE;
-                        level3[part].addSpace(c);
-                    }
-                    TableTuple* slot = level3[part].allocate<TableTuple>();
-                    *slot = tuple;
-                }
-                local_tuples.clear();
-            }
-        }
-
-        // flush remaining
-        if (!local_tuples.empty()) {
+        if (local_tuples.size() >= 256) {
+            std::lock_guard<std::mutex> lock(part_mutexes[part]);
             for (auto& tuple : local_tuples) {
-                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
                 if (level3[part].freeSpace() < sizeof(TableTuple)) {
                     Chunk* c = new Chunk();
                     c->data = new uint8_t[SMALL_CHUNK_SIZE];
@@ -326,8 +312,27 @@ struct JoinAlgorithm {
                 TableTuple* slot = level3[part].allocate<TableTuple>();
                 *slot = tuple;
             }
+            local_tuples.clear();
         }
     }
+
+    // flush remaining
+    if (!local_tuples.empty()) {
+        for (auto& tuple : local_tuples) {
+            size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
+            std::lock_guard<std::mutex> lock(part_mutexes[part]);
+            if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                Chunk* c = new Chunk();
+                c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                c->capacity = SMALL_CHUNK_SIZE;
+                level3[part].addSpace(c);
+            }
+            TableTuple* slot = level3[part].allocate<TableTuple>();
+            *slot = tuple;
+        }
+    }
+}
+
 
     /* ============================================================
      * 2. BUILD HASH TABLE
