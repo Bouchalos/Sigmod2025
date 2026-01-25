@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 1024;
+constexpr size_t CHUNK_SIZE = 4096;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
@@ -273,7 +273,7 @@ struct JoinAlgorithm {
     mutex part_mutexes[num_partitions];
 
     int n = num_partitions;  // num of threads
-    constexpr size_t chunk_size = 1024;  // fixed chunk size
+    constexpr size_t chunk_size = 4096;  // fixed chunk size
 
 #   pragma omp parallel
     {
@@ -291,7 +291,7 @@ struct JoinAlgorithm {
 
             local_tuples.push_back({key, i});
 
-            if (local_tuples.size() >= 256) {
+            if (local_tuples.size() >= 1024) {
                 lock_guard<mutex> lock(part_mutexes[part]);
                 for (auto& tuple : local_tuples) {
                     if (level3[part].freeSpace() < sizeof(TableTuple)) {
@@ -335,8 +335,8 @@ struct JoinAlgorithm {
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
     atomic<size_t> global_idx(0);  //atomic counter
-    constexpr size_t grain_size = 4096;     
-    int num_threads = omp_get_max_threads();
+    constexpr size_t grain_size = 8192;     
+    int num_threads = min(omp_get_max_threads(), 16);;
 
     vector<vector<vector<value_t>>> all_thread_results(num_threads);
     for (int t = 0; t < num_threads; ++t) {
