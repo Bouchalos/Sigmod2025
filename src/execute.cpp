@@ -273,7 +273,7 @@ struct JoinAlgorithm {
     mutex part_mutexes[num_partitions];
 
     int n = num_partitions;  // num of threads
-    constexpr size_t chunk_size = 2048;  // fixed chunk size
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
 #   pragma omp parallel
     {
@@ -528,7 +528,7 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
         output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
     int threads = omp_get_max_threads(); // always use max threads
-    constexpr size_t chunk_size = 2048;  // fixed chunk size
+    constexpr size_t chunk_size = 512;  // fixed chunk size
 
 #pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
     for (size_t j = 0; j < num_cols; ++j) {
