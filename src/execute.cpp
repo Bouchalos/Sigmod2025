@@ -258,7 +258,6 @@ struct JoinAlgorithm {
     size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
     size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-    // Adaptive partitions
     size_t build_probe_size = std::max(build_rows, probe_rows);
     size_t numPartitions = 1;
     if (build_probe_size > 0) {
@@ -271,20 +270,15 @@ struct JoinAlgorithm {
     PartitionAlloc level3[numPartitions];
     std::mutex part_mutexes[numPartitions];
 
-    int max_threads = omp_get_max_threads();
-    int n = std::min<int>(max_threads, build_rows > 0 ? (build_rows + 4095) / 4096 : 1);
+    int n = omp_get_max_threads();  // num of threads
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
-    size_t target_chunks_per_thread = 16;
-    size_t min_chunk = 256;
-    size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thread));
-
-
-#pragma omp parallel
+#   pragma omp parallel
     {
         std::vector<TableTuple> local_tuples;
-        local_tuples.reserve(4096);
+        local_tuples.reserve(1024);
 
-#pragma omp for schedule(guided, chunk_size)
+#   pragma omp for schedule(guided, chunk_size)
         for (size_t i = 0; i < build_rows; ++i) {
             value_t key_val = build_rel[build_col_idx].get(i);
             if (key_val.is_null()) continue;
@@ -313,7 +307,7 @@ struct JoinAlgorithm {
 
         if (!local_tuples.empty()) {
             for (auto& tuple : local_tuples) {
-                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
+                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions - 1);
                 std::lock_guard<std::mutex> lock(part_mutexes[part]);
                 if (level3[part].freeSpace() < sizeof(TableTuple)) {
                     Chunk* c = new Chunk();
@@ -327,24 +321,19 @@ struct JoinAlgorithm {
         }
     }
 
-    UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
-    hash_table.build_from_slabs(level3, numPartitions);
 
-    // ---------------------------
-    // 3. PRECOMPUTE OUTPUT ACCESSORS
-    // ---------------------------
-    struct OutputAccessor { bool from_left; size_t col; };
-    std::vector<OutputAccessor> accessors;
-    accessors.reserve(output_attrs.size());
+    UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
+    hash_table.build_from_slabs(level3, numPartitions); //build the hash table
+
+    struct OutputAccessor { bool from_left; size_t col; };  //struct to precompute output accessors
+    std::vector<OutputAccessor> accessors;  
+    accessors.reserve(output_attrs.size()); 
+    
     for (auto [idx, _] : output_attrs)
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
-    // ---------------------------
-    // 4. PROBE + 5. SINGLE-THREADED AGGREGATION
-    // ---------------------------
-
-    std::atomic<size_t> global_idx(0);
-    constexpr size_t grain_size = 4096;
+    std::atomic<size_t> global_idx(0);  //atomic counter
+    constexpr size_t grain_size = 4096;     
     int num_threads = omp_get_max_threads();
 
     std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
@@ -354,45 +343,43 @@ struct JoinAlgorithm {
             all_thread_results[t][out].reserve(grain_size);
     }
 
-#pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        auto& local = all_thread_results[tid];
+#pragma omp parallel    //parallel probe, with thread stealing (dynamic)
+        {
+            int tid = omp_get_thread_num(); 
+            auto& local = all_thread_results[tid];
 
-        while (true) {
-            size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
-            if (start >= probe_rows) break;
-            size_t end = std::min(start + grain_size, probe_rows);
+            while (true) {
+                size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
+                if (start >= probe_rows) break;
+                size_t end = std::min(start + grain_size, probe_rows);
 
-            for (size_t i = start; i < end; ++i) {
-                value_t key_val = probe_rel[probe_col_idx].get(i);
-                if (key_val.is_null()) continue;
+                for (size_t i = start; i < end; ++i) {
+                    value_t key_val = probe_rel[probe_col_idx].get(i);
+                    if (key_val.is_null()) continue;
 
-                auto matches = hash_table.find(key_val.int_val);
-                for (size_t* match_ptr : matches) {
-                    size_t match_idx = *match_ptr;
+                    auto matches = hash_table.find(key_val.int_val);
+                    for (size_t* match_ptr : matches) {
+                        size_t match_idx = *match_ptr;
 
-                    size_t left_row  = build_left ? match_idx : i;
-                    size_t right_row = build_left ? i         : match_idx;
+                        size_t left_row  = build_left ? match_idx : i;
+                        size_t right_row = build_left ? i         : match_idx;
 
-                    for (size_t out = 0; out < accessors.size(); ++out)
-                        local[out].push_back(accessors[out].from_left
-                                             ? left[accessors[out].col].get(left_row)
-                                             : right[accessors[out].col].get(right_row));
+                        for (size_t out = 0; out < accessors.size(); ++out)
+                            local[out].push_back(accessors[out].from_left
+                                                ? left[accessors[out].col].get(left_row)
+                                                : right[accessors[out].col].get(right_row));
+                    }
                 }
             }
         }
-    }
 
-    // SINGLE-THREADED AGGREGATION
-    for (size_t out = 0; out < accessors.size(); ++out) {
-        for (int t = 0; t < num_threads; ++t) {
-            for (auto& v : all_thread_results[t][out])
-                results[out].append(v);
+        for (size_t out = 0; out < accessors.size(); ++out) {   //single threaded aggeration
+            for (int t = 0; t < num_threads; ++t) {
+                for (auto& v : all_thread_results[t][out])
+                    results[out].append(v);
+            }
         }
     }
-}
-
 };
 
 
@@ -407,7 +394,6 @@ ExecuteResult execute_hash_join(const Plan& plan,
     
     ExecuteResult results; 
 
-    // Η run() πλέον αναλαμβάνει όλη τη δουλειά του Partitioning και του Hash Table
     JoinAlgorithm algo{
         .build_left   = join.build_left,
         .left         = left_res,
@@ -438,9 +424,6 @@ ExecuteResult execute_scan(const Plan& plan,
         auto& out_col = results[out_idx];
         const auto& in_col = table.columns[col_idx];
 
-        /* ============================================================
-         * FAST PATH: INT32 full pages → zero-copy view
-         * ============================================================ */
         if (type == DataType::INT32 && !in_col.pages.empty()) {
             bool can_view = true;
             uint32_t rows_per_page = 0;
@@ -466,13 +449,10 @@ ExecuteResult execute_scan(const Plan& plan,
                     );
                     out_col.view_chunks.push_back(raw);
                 }
-                continue;  // skip slow path
+                continue;  
             }
         }
-
-        /* ============================================================
-         * SLOW PATH: generic scan
-         * ============================================================ */
+        
         ColumnCursor cursor(table, table_id, col_idx, type);
         for (size_t r = 0; r < total_rows; ++r) {
             out_col.append(cursor.next());
@@ -542,24 +522,13 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     output_table.num_rows = num_rows;
 
     output_table.columns.reserve(num_cols);
-    for(size_t j = 0; j < num_cols; ++j)
+    for (size_t j = 0; j < num_cols; ++j)
         output_table.columns.emplace_back(std::get<1>(plan.nodes[plan.root].output_attrs[j]));
 
-    // ---------------------------
-    // Measure total materialization
-    // ---------------------------
+    int threads = omp_get_max_threads(); // always use max threads
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
-    // ---------------------------
-    // Adaptive thread count & chunk size
-    // ---------------------------
-    int max_threads = omp_get_max_threads();
-    int threads = num_rows > 8192 ? std::min(max_threads, static_cast<int>((num_rows+4095)/4096)) : 1;
-    size_t chunk_size = std::max(size_t(1024), (num_rows + threads - 1) / threads);
-
-    // ---------------------------
-    // Parallel per-column, guided schedule
-    // ---------------------------
-#pragma omp parallel for schedule(guided) num_threads(threads)
+#pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
     for (size_t j = 0; j < num_cols; ++j) {
         auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
         auto& src = columns[j];
