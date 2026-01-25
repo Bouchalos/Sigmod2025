@@ -15,9 +15,10 @@
 #include <atomic>
 #include <array>
 #include <nmmintrin.h> 
-#include <omp.h>
 
-constexpr size_t SMALL_CHUNK_SIZE = 16 * 1024; // 16KB
+using namespace std;
+
+constexpr size_t SMALL_CHUNK_SIZE = 8 * 1024; // 8KB
 
 struct StringIndex {
     uint64_t table_id : 6;
@@ -51,12 +52,12 @@ struct PageHeader {
 constexpr size_t CHUNK_SIZE = 1024;
 
 struct PagedColumn {
-    std::vector<std::unique_ptr<value_t[]>> pages;
+    vector<unique_ptr<value_t[]>> pages;
     size_t total_size = 0;
     size_t capacity = 0;
 
     bool is_view = false;
-    std::vector<const int32_t*> view_chunks;
+    vector<const int32_t*> view_chunks;
     uint32_t view_rows_per_page = 0;
 
     void append(const value_t& val) {
@@ -71,14 +72,12 @@ struct PagedColumn {
         total_size++;
     }
 
-    // ΝΕΑ ΜΕΘΟΔΟΣ: Για να αποφύγουμε το overhead του value_t object creation
     void append_int32(int32_t val) {
         size_t offset = total_size & (CHUNK_SIZE - 1);
         if (offset == 0) {
             pages.emplace_back(new value_t[CHUNK_SIZE]);
             capacity += CHUNK_SIZE;
         }
-        // Direct assignment χωρίς constructor overhead
         value_t& slot = pages.back()[offset];
         slot.type = value_t::INT32;
         slot.int_val = val;
@@ -100,7 +99,7 @@ struct PagedColumn {
     size_t size() const { return total_size; }
 };
 
-using ExecuteResult = std::vector<PagedColumn>;
+using ExecuteResult = vector<PagedColumn>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
@@ -244,7 +243,7 @@ struct JoinAlgorithm {
     ExecuteResult&                                   right;
     ExecuteResult&                                   results;
     size_t                                           left_col, right_col;
-    const std::vector<std::tuple<size_t, DataType>>& output_attrs;
+    const vector<tuple<size_t, DataType>>& output_attrs;
 
     void run() {
     using JoinType   = int32_t;
@@ -261,43 +260,39 @@ struct JoinAlgorithm {
     size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
     size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-    // ------------------------
-    // Adaptive partitions
-    // ------------------------
-    size_t build_probe_size = std::max(build_rows, probe_rows);
-    size_t numPartitions = 1; // default για πολύ μικρό join
+    size_t build_probe_size = max(build_rows, probe_rows);
+    size_t num_partitions = 1;
     if (build_probe_size > 0) {
-        numPartitions = std::min<size_t>(64, std::max<size_t>(1, build_probe_size / 4096));
-        size_t p = 1;
-        while (p < numPartitions) p <<= 1;
-        numPartitions = p;
+        num_partitions = min<size_t>(64, max<size_t>(1, build_probe_size / 4096));
+       size_t p = 1;
+        while (p < num_partitions) p <<= 1;
+        num_partitions = p;
     }
 
-    PartitionAlloc level3[numPartitions];
-    std::mutex part_mutexes[numPartitions];
+    PartitionAlloc level3[num_partitions];
+    mutex part_mutexes[num_partitions];
 
-    /* ============================================================
-     * 1. BUILD PHASE - thread-local allocation
-     * ============================================================ */
-#pragma omp parallel
+    int n = num_partitions;  // num of threads
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
+
+#   pragma omp parallel
     {
-        std::vector<TableTuple> local_tuples;
+        vector<TableTuple> local_tuples;
         local_tuples.reserve(1024);
 
-#pragma omp for schedule(static)
+#   pragma omp for schedule(guided, chunk_size)     //collect tuples parallel
         for (size_t i = 0; i < build_rows; ++i) {
             value_t key_val = build_rel[build_col_idx].get(i);
             if (key_val.is_null()) continue;
 
             JoinType key = key_val.int_val;
             uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-            size_t part  = h & (numPartitions - 1);
+            size_t part  = h & (num_partitions - 1);
 
-            TableTuple t{key, i};
-            local_tuples.push_back(t);
+            local_tuples.push_back({key, i});
 
             if (local_tuples.size() >= 256) {
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                lock_guard<mutex> lock(part_mutexes[part]);
                 for (auto& tuple : local_tuples) {
                     if (level3[part].freeSpace() < sizeof(TableTuple)) {
                         Chunk* c = new Chunk();
@@ -312,11 +307,10 @@ struct JoinAlgorithm {
             }
         }
 
-        // flush remaining
-        if (!local_tuples.empty()) {
+        if (!local_tuples.empty()) {    
             for (auto& tuple : local_tuples) {
-                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (num_partitions - 1);
+                lock_guard<mutex> lock(part_mutexes[part]);
                 if (level3[part].freeSpace() < sizeof(TableTuple)) {
                     Chunk* c = new Chunk();
                     c->data = new uint8_t[SMALL_CHUNK_SIZE];
@@ -329,89 +323,65 @@ struct JoinAlgorithm {
         }
     }
 
-    /* ============================================================
-     * 2. BUILD HASH TABLE
-     * ============================================================ */
+
     UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
-    hash_table.build_from_slabs(level3, numPartitions);
+    hash_table.build_from_slabs(level3, num_partitions); //build the hash table from tuples
 
-    /* ============================================================
-     * 3. PRECOMPUTE OUTPUT ACCESSORS
-     * ============================================================ */
-    struct OutputAccessor {
-        bool from_left;
-        size_t col;
-    };
+    struct OutputAccessor { bool from_left; size_t col; };  //struct to precompute output accessors
+    vector<OutputAccessor> accessors;  
+    accessors.reserve(output_attrs.size()); 
+    
+    for (auto [idx, _] : output_attrs)
+        accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
-    std::vector<OutputAccessor> accessors;
-    accessors.reserve(output_attrs.size());
-    for (auto [idx, _] : output_attrs) {
-        if (idx < left.size())
-            accessors.push_back({true, idx});
-        else
-            accessors.push_back({false, idx - left.size()});
-    }
-
-    /* ============================================================
-     * 4. THREAD-LOCAL PROBE PHASE WITH WORK STEALING
-     * ============================================================ */
-    std::atomic<size_t> global_idx(0);
-    constexpr size_t grain_size = 4096;
+    atomic<size_t> global_idx(0);  //atomic counter
+    constexpr size_t grain_size = 4096;     
     int num_threads = omp_get_max_threads();
 
-    std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
+    vector<vector<vector<value_t>>> all_thread_results(num_threads);
     for (int t = 0; t < num_threads; ++t) {
         all_thread_results[t].resize(accessors.size());
         for (size_t out = 0; out < accessors.size(); ++out)
             all_thread_results[t][out].reserve(grain_size);
     }
 
-#pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        auto& local = all_thread_results[tid];
+#pragma omp parallel    //parallel probe, with thread stealing (dynamic)
+        {
+            int tid = omp_get_thread_num(); 
+            auto& local = all_thread_results[tid];
 
-        while (true) {
-            // Work stealing: κάθε thread παίρνει το επόμενο chunk από global index
-            size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
-            if (start >= probe_rows) break;
-            size_t end = std::min(start + grain_size, probe_rows);
+            while (true) {
+                size_t start = global_idx.fetch_add(grain_size, memory_order_relaxed);
+                if (start >= probe_rows) break;
+                size_t end = min(start + grain_size, probe_rows);
 
-            for (size_t i = start; i < end; ++i) {
-                value_t key_val = probe_rel[probe_col_idx].get(i);
-                if (key_val.is_null()) continue;
+                for (size_t i = start; i < end; ++i) {
+                    value_t key_val = probe_rel[probe_col_idx].get(i);
+                    if (key_val.is_null()) continue;
 
-                auto matches = hash_table.find(key_val.int_val);
-                for (size_t* match_ptr : matches) {
-                    size_t match_idx = *match_ptr;
+                    auto matches = hash_table.find(key_val.int_val);
+                    for (size_t* match_ptr : matches) {
+                        size_t match_idx = *match_ptr;
 
-                    size_t left_row  = build_left ? match_idx : i;
-                    size_t right_row = build_left ? i         : match_idx;
+                        size_t left_row  = build_left ? match_idx : i;
+                        size_t right_row = build_left ? i         : match_idx;
 
-                    for (size_t out = 0; out < accessors.size(); ++out) {
-                        const auto& acc = accessors[out];
-                        local[out].push_back(acc.from_left ? left[acc.col].get(left_row)
-                                                           : right[acc.col].get(right_row));
+                        for (size_t out = 0; out < accessors.size(); ++out)
+                            local[out].push_back(accessors[out].from_left
+                                                ? left[accessors[out].col].get(left_row)
+                                                : right[accessors[out].col].get(right_row));
                     }
                 }
             }
         }
-    } // end parallel probe
 
-    /* ============================================================
-     * 5. SINGLE-THREADED AGGREGATION
-     * ============================================================ */
-    for (size_t out = 0; out < accessors.size(); ++out) {
-        for (int t = 0; t < num_threads; ++t) {
-            auto& local_vec = all_thread_results[t][out];
-            for (auto& v : local_vec)
-                results[out].append(v);
+        for (size_t out = 0; out < accessors.size(); ++out) {   //single threaded aggeration
+            for (int t = 0; t < num_threads; ++t) {
+                for (auto& v : all_thread_results[t][out])
+                    results[out].append(v);
+            }
         }
     }
-}
-
-
-
 };
 
 
@@ -419,14 +389,13 @@ struct JoinAlgorithm {
 
 ExecuteResult execute_hash_join(const Plan& plan,
     const JoinNode& join,
-    const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
+    const vector<tuple<size_t, DataType>>& output_attrs) {
     
     auto left_res  = execute_impl(plan, join.left);
     auto right_res = execute_impl(plan, join.right);
     
     ExecuteResult results; 
 
-    // Η run() πλέον αναλαμβάνει όλη τη δουλειά του Partitioning και του Hash Table
     JoinAlgorithm algo{
         .build_left   = join.build_left,
         .left         = left_res,
@@ -443,7 +412,7 @@ ExecuteResult execute_hash_join(const Plan& plan,
 
 ExecuteResult execute_scan(const Plan& plan,
                            const ScanNode& scan,
-                           const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
+                           const vector<tuple<size_t, DataType>>& output_attrs) {
 
     const auto table_id    = scan.base_table_id;
     const auto& table      = plan.inputs[table_id];
@@ -457,25 +426,17 @@ ExecuteResult execute_scan(const Plan& plan,
         auto& out_col = results[out_idx];
         const auto& in_col = table.columns[col_idx];
 
-        /* ============================================================
-         * FAST PATH: INT32 full pages → zero-copy view
-         * ============================================================ */
         if (type == DataType::INT32 && !in_col.pages.empty()) {
             bool can_view = true;
             uint32_t rows_per_page = 0;
 
-            // single pass validation
             for (auto* page : in_col.pages) {
-                const auto* header =
-                    reinterpret_cast<const PageHeader*>(page->data);
-
+                const auto* header = reinterpret_cast<const PageHeader*>(page->data);
                 if (header->num_rows != header->val_count) {
                     can_view = false;
                     break;
                 }
-
-                if (rows_per_page == 0)
-                    rows_per_page = header->num_rows;
+                if (rows_per_page == 0) rows_per_page = header->num_rows;
             }
 
             if (can_view) {
@@ -485,37 +446,30 @@ ExecuteResult execute_scan(const Plan& plan,
                 out_col.view_chunks.reserve(in_col.pages.size());
 
                 for (auto* page : in_col.pages) {
-                    const auto* raw =
-                        reinterpret_cast<const int32_t*>(
-                            reinterpret_cast<const uint8_t*>(page->data)
-                            + sizeof(PageHeader)
-                        );
+                    const auto* raw = reinterpret_cast<const int32_t*>(
+                        reinterpret_cast<const uint8_t*>(page->data) + sizeof(PageHeader)
+                    );
                     out_col.view_chunks.push_back(raw);
                 }
-                continue; // ⬅ skip slow path
+                continue;  
             }
         }
-
-        /* ============================================================
-         * SLOW PATH: generic scan
-         * ============================================================ */
+        
         ColumnCursor cursor(table, table_id, col_idx, type);
-
         for (size_t r = 0; r < total_rows; ++r) {
             out_col.append(cursor.next());
         }
     }
-
     return results;
 }
 
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
     auto& node = plan.nodes[node_idx];
-    return std::visit(
+    return visit(
         [&](const auto& value) {
-            using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, JoinNode>) {
+            using T = decay_t<decltype(value)>;
+            if constexpr (is_same_v<T, JoinNode>) {
                 return execute_hash_join(plan, value, node.output_attrs);
             } else {
                 return execute_scan(plan, value, node.output_attrs);
@@ -524,7 +478,7 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
         node.data);
 }
 
-std::string materialize_string(const value_t& val, const Plan& plan) {
+string materialize_string(const value_t& val, const Plan& plan) {
     StringIndex idx = val.str_index;
     if (idx.table_id >= plan.inputs.size()) return "";
     const auto& col = plan.inputs[idx.table_id].columns[idx.col_id];
@@ -534,7 +488,7 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
     uint16_t header = *reinterpret_cast<const uint16_t*>(page_data);
 
     if (header == 0xFFFF) {
-        std::string full_string;
+        string full_string;
         uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
         if (chunk_len > PAGE_SIZE) chunk_len = 0;
         full_string.append(reinterpret_cast<const char*>(page_data + 4), chunk_len);
@@ -556,78 +510,63 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
     if (idx.offset + idx.length > PAGE_SIZE) return "";
     const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
     size_t len = idx.length;
-    if (len > 0 && ptr[len - 1] == '\0') return std::string(ptr, len - 1);
-    return std::string(ptr, len);
+    if (len > 0 && ptr[len - 1] == '\0') return string(ptr, len - 1);
+    return string(ptr, len);
 }
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     auto columns = execute_impl(plan, plan.root);
-    
+
     size_t num_rows = columns.empty() ? 0 : columns[0].size();
     size_t num_cols = columns.size();
 
     ColumnarTable output_table;
     output_table.num_rows = num_rows;
-    
+
     output_table.columns.reserve(num_cols);
-    for(size_t j = 0; j < num_cols; ++j) {
-        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
-        output_table.columns.emplace_back(type); 
-    }
+    for (size_t j = 0; j < num_cols; ++j)
+        output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
-    // ---------------------------
-    // Determine number of threads dynamically
-    // ---------------------------
-    int max_threads = omp_get_max_threads();
-    int num_threads = 1; // default single-threaded for very small datasets
+    int threads = omp_get_max_threads(); // always use max threads
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
-    if (num_rows > 8192) {
-        // scale linearly: 1 thread / 4096 rows (adjust threshold as needed)
-        num_threads = static_cast<int>(std::min<size_t>(max_threads, (num_rows + 4095) / 4096));
-    }
-
-    // ---------------------------
-    // Parallel column population
-    // ---------------------------
-    #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for(size_t j = 0; j < num_cols; ++j) {
-        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
+#pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
+    for (size_t j = 0; j < num_cols; ++j) {
+        auto type = get<1>(plan.nodes[plan.root].output_attrs[j]);
         auto& src = columns[j];
         auto& dst = output_table.columns[j];
 
         if (type == DataType::INT32) {
             ColumnInserter<int32_t> inserter(dst);
-
-            if (src.is_view) {
-                uint32_t rows_per_pg = src.view_rows_per_page;
-                size_t num_pages = src.view_chunks.size();
-
-                for (size_t pg = 0; pg < num_pages; ++pg) {
+            if (src.is_view && src.total_size == num_rows) {
+                for (size_t pg = 0; pg < src.view_chunks.size(); ++pg) {
                     const int32_t* chunk = src.view_chunks[pg];
-                    size_t start = pg * rows_per_pg;
-                    size_t end   = std::min(start + rows_per_pg, num_rows);
-
-                    #pragma omp simd
+                    size_t start = pg * src.view_rows_per_page;
+                    size_t end   = min(start + src.view_rows_per_page, num_rows);
                     for (size_t i = start; i < end; ++i)
                         inserter.insert(chunk[i - start]);
                 }
             } else {
-                #pragma omp simd
-                for (size_t i = 0; i < num_rows; ++i) {
-                    value_t val = src.get(i);
-                    if (val.is_null()) inserter.insert_null();
-                    else inserter.insert(val.int_val);
+                for (size_t start = 0; start < num_rows; start += chunk_size) {
+                    size_t end = min(start + chunk_size, num_rows);
+                    for (size_t i = start; i < end; ++i) {
+                        value_t val = src.get(i);
+                        if (val.is_null()) inserter.insert_null();
+                        else inserter.insert(val.int_val);
+                    }
                 }
             }
             inserter.finalize();
-        } 
+        }
         else if (type == DataType::VARCHAR) {
-            ColumnInserter<std::string> inserter(dst);
-
-            for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = src.get(i);
-                if (val.is_null()) inserter.insert_null();
-                else inserter.insert(materialize_string(val, plan));
+            ColumnInserter<string> inserter(dst);
+            for (size_t start = 0; start < num_rows; start += chunk_size) {
+                size_t end = min(start + chunk_size, num_rows);
+                for (size_t i = start; i < end; ++i) {
+                    value_t val = src.get(i);
+                    if (val.is_null()) inserter.insert_null();
+                    else inserter.insert(materialize_string(val, plan));
+                }
             }
             inserter.finalize();
         }
@@ -635,6 +574,9 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
 
     return output_table;
 }
+
+
+
 
 
 void* build_context() { return nullptr; }
