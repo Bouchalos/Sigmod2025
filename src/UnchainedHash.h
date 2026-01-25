@@ -214,22 +214,39 @@ public:
 }
 
     std::vector<V*> find(const K& key) {
-        std::vector<V*> out;
-        if (directory.empty()) return out;
+    std::vector<V*> out;
 
-        uint64_t h = hash_key(key);
-        size_t slot = static_cast<size_t>(h & (directory.size() - 1));
-        uint64_t entry = directory[slot];
+    if (directory.empty()) return out;
 
-        if (!bloom_may_contain(h)) return out;  //checks if the element might be into the table
+    uint64_t h = hash_key(key);
 
-        uint16_t probe_mask = fingerprint_to_mask(mini_hash(h));    //takes the fingerprint
-        uint16_t slot_filter = static_cast<uint16_t>(entry & 0xFFFFu);  //takes the fingerprint of the slot
-        if ((slot_filter & probe_mask) != probe_mask) return out;   //sees if the fingerprint matches to the slot comparing it's bits
+    // ---------------------------
+    // Δύο πρώιμοι αποκλεισμοί (fast path)
+    // ---------------------------
+    size_t slot = static_cast<size_t>(h & (directory.size() - 1));
+    uint64_t entry = directory[slot];
 
-        produceMatches(key, slot, out); 
-        return out;
+    if (!bloom_may_contain(h)) return out;
+
+    uint16_t probe_mask = fingerprint_to_mask(mini_hash(h));
+    uint16_t slot_filter = static_cast<uint16_t>(entry & 0xFFFFu);
+    if ((slot_filter & probe_mask) != probe_mask) return out;
+
+    size_t dir_n = directory.size();
+    uint64_t start = directory[slot] >> 16;
+    uint64_t end = (slot + 1 == dir_n) ? adjacency.size() : (directory[slot + 1] >> 16);
+    out.reserve(end - start);
+
+    Tuple* ptr = adjacency.data() + start;
+    for (uint64_t i = 0; i < end - start; ++i) {
+        if (ptr[i].key == key) {
+            out.push_back(&ptr[i].value);
+        }
     }
+
+    return out;
+}
+
 
 private:
     void produceMatches(const K& key, size_t slot, std::vector<V*>& out) {  //finds the key and returns the values
