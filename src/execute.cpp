@@ -15,9 +15,8 @@
 #include <atomic>
 #include <array>
 #include <nmmintrin.h> 
-#include <omp.h>
 
-constexpr size_t SMALL_CHUNK_SIZE = 16 * 1024; // 16KB
+constexpr size_t SMALL_CHUNK_SIZE = 8 * 1024; // 8KB
 
 struct StringIndex {
     uint64_t table_id : 6;
@@ -71,14 +70,12 @@ struct PagedColumn {
         total_size++;
     }
 
-    // ΝΕΑ ΜΕΘΟΔΟΣ: Για να αποφύγουμε το overhead του value_t object creation
     void append_int32(int32_t val) {
         size_t offset = total_size & (CHUNK_SIZE - 1);
         if (offset == 0) {
             pages.emplace_back(new value_t[CHUNK_SIZE]);
             capacity += CHUNK_SIZE;
         }
-        // Direct assignment χωρίς constructor overhead
         value_t& slot = pages.back()[offset];
         slot.type = value_t::INT32;
         slot.int_val = val;
@@ -261,14 +258,12 @@ struct JoinAlgorithm {
     size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
     size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-    // ------------------------
     // Adaptive partitions
-    // ------------------------
     size_t build_probe_size = std::max(build_rows, probe_rows);
-    size_t numPartitions = 1; // default για πολύ μικρό join
+    size_t numPartitions = 1;
     if (build_probe_size > 0) {
         numPartitions = std::min<size_t>(64, std::max<size_t>(1, build_probe_size / 4096));
-        size_t p = 1;
+       size_t p = 1;
         while (p < numPartitions) p <<= 1;
         numPartitions = p;
     }
@@ -276,33 +271,50 @@ struct JoinAlgorithm {
     PartitionAlloc level3[numPartitions];
     std::mutex part_mutexes[numPartitions];
 
-int max_threads = omp_get_max_threads();
-int n = std::min<int>(max_threads, build_rows > 0 ? (build_rows + 4095) / 4096 : 1);
+    int max_threads = omp_get_max_threads();
+    int n = std::min<int>(max_threads, build_rows > 0 ? (build_rows + 4095) / 4096 : 1);
 
-// Υπολογισμός δυναμικού chunk_size
-size_t target_chunks_per_thread = 16;   // ρυθμίσιμο
-size_t min_chunk = 256;                 // δεν θέλουμε πολύ μικρά chunks
-size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thread));
+    size_t target_chunks_per_thread = 16;
+    size_t min_chunk = 256;
+    size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thread));
+
 
 #pragma omp parallel
-{
-    std::vector<TableTuple> local_tuples;
-    local_tuples.reserve(4096);
+    {
+        std::vector<TableTuple> local_tuples;
+        local_tuples.reserve(4096);
 
 #pragma omp for schedule(guided, chunk_size)
-    for (size_t i = 0; i < build_rows; ++i) {
-        value_t key_val = build_rel[build_col_idx].get(i);
-        if (key_val.is_null()) continue;
+        for (size_t i = 0; i < build_rows; ++i) {
+            value_t key_val = build_rel[build_col_idx].get(i);
+            if (key_val.is_null()) continue;
 
-        JoinType key = key_val.int_val;
-        uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-        size_t part  = h & (numPartitions - 1);
+            JoinType key = key_val.int_val;
+            uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+            size_t part  = h & (numPartitions - 1);
 
-        local_tuples.push_back({key, i});
+            local_tuples.push_back({key, i});
 
-        if (local_tuples.size() >= 256) {
-            std::lock_guard<std::mutex> lock(part_mutexes[part]);
+            if (local_tuples.size() >= 256) {
+                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                for (auto& tuple : local_tuples) {
+                    if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                        Chunk* c = new Chunk();
+                        c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                        c->capacity = SMALL_CHUNK_SIZE;
+                        level3[part].addSpace(c);
+                    }
+                    TableTuple* slot = level3[part].allocate<TableTuple>();
+                    *slot = tuple;
+                }
+                local_tuples.clear();
+            }
+        }
+
+        if (!local_tuples.empty()) {
             for (auto& tuple : local_tuples) {
+                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
+                std::lock_guard<std::mutex> lock(part_mutexes[part]);
                 if (level3[part].freeSpace() < sizeof(TableTuple)) {
                     Chunk* c = new Chunk();
                     c->data = new uint8_t[SMALL_CHUNK_SIZE];
@@ -312,54 +324,25 @@ size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thre
                 TableTuple* slot = level3[part].allocate<TableTuple>();
                 *slot = tuple;
             }
-            local_tuples.clear();
         }
     }
 
-    // flush remaining
-    if (!local_tuples.empty()) {
-        for (auto& tuple : local_tuples) {
-            size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
-            std::lock_guard<std::mutex> lock(part_mutexes[part]);
-            if (level3[part].freeSpace() < sizeof(TableTuple)) {
-                Chunk* c = new Chunk();
-                c->data = new uint8_t[SMALL_CHUNK_SIZE];
-                c->capacity = SMALL_CHUNK_SIZE;
-                level3[part].addSpace(c);
-            }
-            TableTuple* slot = level3[part].allocate<TableTuple>();
-            *slot = tuple;
-        }
-    }
-}
-
-
-    /* ============================================================
-     * 2. BUILD HASH TABLE
-     * ============================================================ */
     UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
     hash_table.build_from_slabs(level3, numPartitions);
 
-    /* ============================================================
-     * 3. PRECOMPUTE OUTPUT ACCESSORS
-     * ============================================================ */
-    struct OutputAccessor {
-        bool from_left;
-        size_t col;
-    };
-
+    // ---------------------------
+    // 3. PRECOMPUTE OUTPUT ACCESSORS
+    // ---------------------------
+    struct OutputAccessor { bool from_left; size_t col; };
     std::vector<OutputAccessor> accessors;
     accessors.reserve(output_attrs.size());
-    for (auto [idx, _] : output_attrs) {
-        if (idx < left.size())
-            accessors.push_back({true, idx});
-        else
-            accessors.push_back({false, idx - left.size()});
-    }
+    for (auto [idx, _] : output_attrs)
+        accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
-    /* ============================================================
-     * 4. THREAD-LOCAL PROBE PHASE WITH WORK STEALING
-     * ============================================================ */
+    // ---------------------------
+    // 4. PROBE + 5. SINGLE-THREADED AGGREGATION
+    // ---------------------------
+
     std::atomic<size_t> global_idx(0);
     constexpr size_t grain_size = 4096;
     int num_threads = omp_get_max_threads();
@@ -377,7 +360,6 @@ size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thre
         auto& local = all_thread_results[tid];
 
         while (true) {
-            // Work stealing: κάθε thread παίρνει το επόμενο chunk από global index
             size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
             if (start >= probe_rows) break;
             size_t end = std::min(start + grain_size, probe_rows);
@@ -393,27 +375,24 @@ size_t chunk_size = std::max(min_chunk, build_rows / (n * target_chunks_per_thre
                     size_t left_row  = build_left ? match_idx : i;
                     size_t right_row = build_left ? i         : match_idx;
 
-                    for (size_t out = 0; out < accessors.size(); ++out) {
-                        const auto& acc = accessors[out];
-                        local[out].push_back(acc.from_left ? left[acc.col].get(left_row)
-                                                           : right[acc.col].get(right_row));
-                    }
+                    for (size_t out = 0; out < accessors.size(); ++out)
+                        local[out].push_back(accessors[out].from_left
+                                             ? left[accessors[out].col].get(left_row)
+                                             : right[accessors[out].col].get(right_row));
                 }
             }
         }
-    } // end parallel probe
+    }
 
-    /* ============================================================
-     * 5. SINGLE-THREADED AGGREGATION
-     * ============================================================ */
+    // SINGLE-THREADED AGGREGATION
     for (size_t out = 0; out < accessors.size(); ++out) {
         for (int t = 0; t < num_threads; ++t) {
-            auto& local_vec = all_thread_results[t][out];
-            for (auto& v : local_vec)
+            for (auto& v : all_thread_results[t][out])
                 results[out].append(v);
         }
     }
 }
+
 };
 
 
@@ -466,18 +445,13 @@ ExecuteResult execute_scan(const Plan& plan,
             bool can_view = true;
             uint32_t rows_per_page = 0;
 
-            // single pass validation
             for (auto* page : in_col.pages) {
-                const auto* header =
-                    reinterpret_cast<const PageHeader*>(page->data);
-
+                const auto* header = reinterpret_cast<const PageHeader*>(page->data);
                 if (header->num_rows != header->val_count) {
                     can_view = false;
                     break;
                 }
-
-                if (rows_per_page == 0)
-                    rows_per_page = header->num_rows;
+                if (rows_per_page == 0) rows_per_page = header->num_rows;
             }
 
             if (can_view) {
@@ -487,14 +461,12 @@ ExecuteResult execute_scan(const Plan& plan,
                 out_col.view_chunks.reserve(in_col.pages.size());
 
                 for (auto* page : in_col.pages) {
-                    const auto* raw =
-                        reinterpret_cast<const int32_t*>(
-                            reinterpret_cast<const uint8_t*>(page->data)
-                            + sizeof(PageHeader)
-                        );
+                    const auto* raw = reinterpret_cast<const int32_t*>(
+                        reinterpret_cast<const uint8_t*>(page->data) + sizeof(PageHeader)
+                    );
                     out_col.view_chunks.push_back(raw);
                 }
-                continue; // ⬅ skip slow path
+                continue;  // skip slow path
             }
         }
 
@@ -502,12 +474,10 @@ ExecuteResult execute_scan(const Plan& plan,
          * SLOW PATH: generic scan
          * ============================================================ */
         ColumnCursor cursor(table, table_id, col_idx, type);
-
         for (size_t r = 0; r < total_rows; ++r) {
             out_col.append(cursor.next());
         }
     }
-
     return results;
 }
 
@@ -564,72 +534,68 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     auto columns = execute_impl(plan, plan.root);
-    
+
     size_t num_rows = columns.empty() ? 0 : columns[0].size();
     size_t num_cols = columns.size();
 
     ColumnarTable output_table;
     output_table.num_rows = num_rows;
-    
+
     output_table.columns.reserve(num_cols);
-    for(size_t j = 0; j < num_cols; ++j) {
-        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
-        output_table.columns.emplace_back(type); 
-    }
+    for(size_t j = 0; j < num_cols; ++j)
+        output_table.columns.emplace_back(std::get<1>(plan.nodes[plan.root].output_attrs[j]));
 
     // ---------------------------
-    // Determine number of threads dynamically
+    // Measure total materialization
+    // ---------------------------
+
+    // ---------------------------
+    // Adaptive thread count & chunk size
     // ---------------------------
     int max_threads = omp_get_max_threads();
-    int num_threads = 1; // default single-threaded for very small datasets
-
-    if (num_rows > 8192) {
-        // scale linearly: 1 thread / 4096 rows (adjust threshold as needed)
-        num_threads = static_cast<int>(std::min<size_t>(max_threads, (num_rows + 4095) / 4096));
-    }
+    int threads = num_rows > 8192 ? std::min(max_threads, static_cast<int>((num_rows+4095)/4096)) : 1;
+    size_t chunk_size = std::max(size_t(1024), (num_rows + threads - 1) / threads);
 
     // ---------------------------
-    // Parallel column population
+    // Parallel per-column, guided schedule
     // ---------------------------
-    #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
-    for(size_t j = 0; j < num_cols; ++j) {
+#pragma omp parallel for schedule(guided) num_threads(threads)
+    for (size_t j = 0; j < num_cols; ++j) {
         auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
         auto& src = columns[j];
         auto& dst = output_table.columns[j];
 
         if (type == DataType::INT32) {
             ColumnInserter<int32_t> inserter(dst);
-
-            if (src.is_view) {
-                uint32_t rows_per_pg = src.view_rows_per_page;
-                size_t num_pages = src.view_chunks.size();
-
-                for (size_t pg = 0; pg < num_pages; ++pg) {
+            if (src.is_view && src.total_size == num_rows) {
+                for (size_t pg = 0; pg < src.view_chunks.size(); ++pg) {
                     const int32_t* chunk = src.view_chunks[pg];
-                    size_t start = pg * rows_per_pg;
-                    size_t end   = std::min(start + rows_per_pg, num_rows);
-
-                    #pragma omp simd
+                    size_t start = pg * src.view_rows_per_page;
+                    size_t end   = std::min(start + src.view_rows_per_page, num_rows);
                     for (size_t i = start; i < end; ++i)
                         inserter.insert(chunk[i - start]);
                 }
             } else {
-                #pragma omp simd
-                for (size_t i = 0; i < num_rows; ++i) {
-                    value_t val = src.get(i);
-                    if (val.is_null()) inserter.insert_null();
-                    else inserter.insert(val.int_val);
+                for (size_t start = 0; start < num_rows; start += chunk_size) {
+                    size_t end = std::min(start + chunk_size, num_rows);
+                    for (size_t i = start; i < end; ++i) {
+                        value_t val = src.get(i);
+                        if (val.is_null()) inserter.insert_null();
+                        else inserter.insert(val.int_val);
+                    }
                 }
             }
             inserter.finalize();
-        } 
+        }
         else if (type == DataType::VARCHAR) {
             ColumnInserter<std::string> inserter(dst);
-
-            for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = src.get(i);
-                if (val.is_null()) inserter.insert_null();
-                else inserter.insert(materialize_string(val, plan));
+            for (size_t start = 0; start < num_rows; start += chunk_size) {
+                size_t end = std::min(start + chunk_size, num_rows);
+                for (size_t i = start; i < end; ++i) {
+                    value_t val = src.get(i);
+                    if (val.is_null()) inserter.insert_null();
+                    else inserter.insert(materialize_string(val, plan));
+                }
             }
             inserter.finalize();
         }
@@ -637,6 +603,9 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
 
     return output_table;
 }
+
+
+
 
 
 void* build_context() { return nullptr; }
