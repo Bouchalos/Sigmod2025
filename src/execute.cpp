@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 4096;
+constexpr size_t CHUNK_SIZE = 1024;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
