@@ -335,7 +335,7 @@ struct JoinAlgorithm {
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
     atomic<size_t> global_idx(0);  //atomic counter
-    constexpr size_t grain_size = 4096;     
+    constexpr size_t grain_size = 2048;     
     int num_threads = omp_get_max_threads();
 
     vector<vector<vector<value_t>>> all_thread_results(num_threads);
@@ -527,7 +527,7 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     for (size_t j = 0; j < num_cols; ++j)
         output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
-    int threads = omp_get_max_threads() / 2; // always use max threads
+    int threads = omp_get_max_threads(); // always use max threads
     constexpr size_t chunk_size = 2048;  // fixed chunk size
 
 #pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
