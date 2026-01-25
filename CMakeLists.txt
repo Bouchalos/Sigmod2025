@@ -106,6 +106,7 @@ target_link_libraries(test_column_store PRIVATE
     range-v3 
     nlohmann_json::nlohmann_json 
     sqlparser
+    OpenMP::OpenMP_CXX
 )
 
 target_include_directories(test_column_store PRIVATE include src)

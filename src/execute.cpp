@@ -16,6 +16,8 @@
 #include <array>
 #include <nmmintrin.h> 
 
+using namespace std;
+
 constexpr size_t SMALL_CHUNK_SIZE = 8 * 1024; // 8KB
 
 struct StringIndex {
@@ -50,12 +52,12 @@ struct PageHeader {
 constexpr size_t CHUNK_SIZE = 1024;
 
 struct PagedColumn {
-    std::vector<std::unique_ptr<value_t[]>> pages;
+    vector<unique_ptr<value_t[]>> pages;
     size_t total_size = 0;
     size_t capacity = 0;
 
     bool is_view = false;
-    std::vector<const int32_t*> view_chunks;
+    vector<const int32_t*> view_chunks;
     uint32_t view_rows_per_page = 0;
 
     void append(const value_t& val) {
@@ -97,7 +99,7 @@ struct PagedColumn {
     size_t size() const { return total_size; }
 };
 
-using ExecuteResult = std::vector<PagedColumn>;
+using ExecuteResult = vector<PagedColumn>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
@@ -241,7 +243,7 @@ struct JoinAlgorithm {
     ExecuteResult&                                   right;
     ExecuteResult&                                   results;
     size_t                                           left_col, right_col;
-    const std::vector<std::tuple<size_t, DataType>>& output_attrs;
+    const vector<tuple<size_t, DataType>>& output_attrs;
 
     void run() {
     using JoinType   = int32_t;
@@ -258,39 +260,39 @@ struct JoinAlgorithm {
     size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
     size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-    size_t build_probe_size = std::max(build_rows, probe_rows);
-    size_t numPartitions = 1;
+    size_t build_probe_size = max(build_rows, probe_rows);
+    size_t num_partitions = 1;
     if (build_probe_size > 0) {
-        numPartitions = std::min<size_t>(64, std::max<size_t>(1, build_probe_size / 4096));
+        num_partitions = min<size_t>(64, max<size_t>(1, build_probe_size / 4096));
        size_t p = 1;
-        while (p < numPartitions) p <<= 1;
-        numPartitions = p;
+        while (p < num_partitions) p <<= 1;
+        num_partitions = p;
     }
 
-    PartitionAlloc level3[numPartitions];
-    std::mutex part_mutexes[numPartitions];
+    PartitionAlloc level3[num_partitions];
+    mutex part_mutexes[num_partitions];
 
-    int n = omp_get_max_threads();  // num of threads
+    int n = num_partitions;  // num of threads
     constexpr size_t chunk_size = 1024;  // fixed chunk size
 
 #   pragma omp parallel
     {
-        std::vector<TableTuple> local_tuples;
+        vector<TableTuple> local_tuples;
         local_tuples.reserve(1024);
 
-#   pragma omp for schedule(guided, chunk_size)
+#   pragma omp for schedule(guided, chunk_size)     //collect tuples parallel
         for (size_t i = 0; i < build_rows; ++i) {
             value_t key_val = build_rel[build_col_idx].get(i);
             if (key_val.is_null()) continue;
 
             JoinType key = key_val.int_val;
             uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
-            size_t part  = h & (numPartitions - 1);
+            size_t part  = h & (num_partitions - 1);
 
             local_tuples.push_back({key, i});
 
             if (local_tuples.size() >= 256) {
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                lock_guard<mutex> lock(part_mutexes[part]);
                 for (auto& tuple : local_tuples) {
                     if (level3[part].freeSpace() < sizeof(TableTuple)) {
                         Chunk* c = new Chunk();
@@ -305,10 +307,10 @@ struct JoinAlgorithm {
             }
         }
 
-        if (!local_tuples.empty()) {
+        if (!local_tuples.empty()) {    
             for (auto& tuple : local_tuples) {
-                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions - 1);
-                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (num_partitions - 1);
+                lock_guard<mutex> lock(part_mutexes[part]);
                 if (level3[part].freeSpace() < sizeof(TableTuple)) {
                     Chunk* c = new Chunk();
                     c->data = new uint8_t[SMALL_CHUNK_SIZE];
@@ -323,20 +325,20 @@ struct JoinAlgorithm {
 
 
     UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
-    hash_table.build_from_slabs(level3, numPartitions); //build the hash table
+    hash_table.build_from_slabs(level3, num_partitions); //build the hash table from tuples
 
     struct OutputAccessor { bool from_left; size_t col; };  //struct to precompute output accessors
-    std::vector<OutputAccessor> accessors;  
+    vector<OutputAccessor> accessors;  
     accessors.reserve(output_attrs.size()); 
     
     for (auto [idx, _] : output_attrs)
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
-    std::atomic<size_t> global_idx(0);  //atomic counter
+    atomic<size_t> global_idx(0);  //atomic counter
     constexpr size_t grain_size = 4096;     
     int num_threads = omp_get_max_threads();
 
-    std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
+    vector<vector<vector<value_t>>> all_thread_results(num_threads);
     for (int t = 0; t < num_threads; ++t) {
         all_thread_results[t].resize(accessors.size());
         for (size_t out = 0; out < accessors.size(); ++out)
@@ -349,9 +351,9 @@ struct JoinAlgorithm {
             auto& local = all_thread_results[tid];
 
             while (true) {
-                size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
+                size_t start = global_idx.fetch_add(grain_size, memory_order_relaxed);
                 if (start >= probe_rows) break;
-                size_t end = std::min(start + grain_size, probe_rows);
+                size_t end = min(start + grain_size, probe_rows);
 
                 for (size_t i = start; i < end; ++i) {
                     value_t key_val = probe_rel[probe_col_idx].get(i);
@@ -387,7 +389,7 @@ struct JoinAlgorithm {
 
 ExecuteResult execute_hash_join(const Plan& plan,
     const JoinNode& join,
-    const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
+    const vector<tuple<size_t, DataType>>& output_attrs) {
     
     auto left_res  = execute_impl(plan, join.left);
     auto right_res = execute_impl(plan, join.right);
@@ -410,7 +412,7 @@ ExecuteResult execute_hash_join(const Plan& plan,
 
 ExecuteResult execute_scan(const Plan& plan,
                            const ScanNode& scan,
-                           const std::vector<std::tuple<size_t, DataType>>& output_attrs) {
+                           const vector<tuple<size_t, DataType>>& output_attrs) {
 
     const auto table_id    = scan.base_table_id;
     const auto& table      = plan.inputs[table_id];
@@ -464,10 +466,10 @@ ExecuteResult execute_scan(const Plan& plan,
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
     auto& node = plan.nodes[node_idx];
-    return std::visit(
+    return visit(
         [&](const auto& value) {
-            using T = std::decay_t<decltype(value)>;
-            if constexpr (std::is_same_v<T, JoinNode>) {
+            using T = decay_t<decltype(value)>;
+            if constexpr (is_same_v<T, JoinNode>) {
                 return execute_hash_join(plan, value, node.output_attrs);
             } else {
                 return execute_scan(plan, value, node.output_attrs);
@@ -476,7 +478,7 @@ ExecuteResult execute_impl(const Plan& plan, size_t node_idx) {
         node.data);
 }
 
-std::string materialize_string(const value_t& val, const Plan& plan) {
+string materialize_string(const value_t& val, const Plan& plan) {
     StringIndex idx = val.str_index;
     if (idx.table_id >= plan.inputs.size()) return "";
     const auto& col = plan.inputs[idx.table_id].columns[idx.col_id];
@@ -486,7 +488,7 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
     uint16_t header = *reinterpret_cast<const uint16_t*>(page_data);
 
     if (header == 0xFFFF) {
-        std::string full_string;
+        string full_string;
         uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
         if (chunk_len > PAGE_SIZE) chunk_len = 0;
         full_string.append(reinterpret_cast<const char*>(page_data + 4), chunk_len);
@@ -508,8 +510,8 @@ std::string materialize_string(const value_t& val, const Plan& plan) {
     if (idx.offset + idx.length > PAGE_SIZE) return "";
     const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
     size_t len = idx.length;
-    if (len > 0 && ptr[len - 1] == '\0') return std::string(ptr, len - 1);
-    return std::string(ptr, len);
+    if (len > 0 && ptr[len - 1] == '\0') return string(ptr, len - 1);
+    return string(ptr, len);
 }
 
 ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
@@ -523,14 +525,14 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
 
     output_table.columns.reserve(num_cols);
     for (size_t j = 0; j < num_cols; ++j)
-        output_table.columns.emplace_back(std::get<1>(plan.nodes[plan.root].output_attrs[j]));
+        output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
     int threads = omp_get_max_threads(); // always use max threads
     constexpr size_t chunk_size = 1024;  // fixed chunk size
 
 #pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
     for (size_t j = 0; j < num_cols; ++j) {
-        auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
+        auto type = get<1>(plan.nodes[plan.root].output_attrs[j]);
         auto& src = columns[j];
         auto& dst = output_table.columns[j];
 
@@ -540,13 +542,13 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
                 for (size_t pg = 0; pg < src.view_chunks.size(); ++pg) {
                     const int32_t* chunk = src.view_chunks[pg];
                     size_t start = pg * src.view_rows_per_page;
-                    size_t end   = std::min(start + src.view_rows_per_page, num_rows);
+                    size_t end   = min(start + src.view_rows_per_page, num_rows);
                     for (size_t i = start; i < end; ++i)
                         inserter.insert(chunk[i - start]);
                 }
             } else {
                 for (size_t start = 0; start < num_rows; start += chunk_size) {
-                    size_t end = std::min(start + chunk_size, num_rows);
+                    size_t end = min(start + chunk_size, num_rows);
                     for (size_t i = start; i < end; ++i) {
                         value_t val = src.get(i);
                         if (val.is_null()) inserter.insert_null();
@@ -557,9 +559,9 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
             inserter.finalize();
         }
         else if (type == DataType::VARCHAR) {
-            ColumnInserter<std::string> inserter(dst);
+            ColumnInserter<string> inserter(dst);
             for (size_t start = 0; start < num_rows; start += chunk_size) {
-                size_t end = std::min(start + chunk_size, num_rows);
+                size_t end = min(start + chunk_size, num_rows);
                 for (size_t i = start; i < end; ++i) {
                     value_t val = src.get(i);
                     if (val.is_null()) inserter.insert_null();

@@ -8,6 +8,8 @@
 #include <chrono>
 #include <iostream>
 
+using namespace std;
+
 struct Chunk {      //chunk of data
     uint8_t* data;
     uint32_t offset;
@@ -47,13 +49,13 @@ public:
     };
 
 private:
-    std::vector<uint64_t> directory;  
-    std::vector<Tuple> adjacency;
+    vector<uint64_t> directory;  
+    vector<Tuple> adjacency;
 
-    std::vector<uint64_t> bloom_bits;   //bloom filter map
+    vector<uint64_t> bloom_bits;   //bloom filter map
     size_t bloom_bit_count = 0;     //total bloom bits
 
-    std::vector<Tuple> raw_tuples;
+    vector<Tuple> raw_tuples;
 
     uint64_t hash_key(const K& key) const {
         if constexpr (sizeof(K) <= 4) {
@@ -129,112 +131,112 @@ public:
     }
 
    void build_from_slabs(PartitionAlloc* partitions, size_t num_partitions) {
-    const size_t dir_n = directory.size();
-    
-    std::fill(directory.begin(), directory.end(), 0);
-    std::fill(bloom_bits.begin(), bloom_bits.end(), 0);
-    size_t total_tuples_sum = 0;
+        const size_t dir_n = directory.size();  //dir size as hashtable size
+        
+        fill(directory.begin(), directory.end(), 0);    
+        fill(bloom_bits.begin(), bloom_bits.end(), 0);
+        size_t total_tuples_sum = 0;
 
 
-        #pragma omp parallel reduction(+:total_tuples_sum)
-        {
-            #pragma omp for
-            for (size_t p = 0; p < num_partitions; ++p) {
-                size_t p_count = 0;
-                Chunk* curr = partitions[p].current_chunk;
-                while (curr) {
-                    size_t n = curr->offset / sizeof(Tuple);
-                    Tuple* ts = reinterpret_cast<Tuple*>(curr->data);
-                    for (size_t i = 0; i < n; ++i) {
-                        uint64_t h = hash_key(ts[i].key);
-                        size_t slot = static_cast<size_t>(h & (dir_n - 1));
-                        
-                        #pragma omp atomic
-                        directory[slot] += (1ULL << 16);
-                        
-                        uint16_t mask = fingerprint_to_mask(mini_hash(h));
-                        #pragma omp atomic
-                        directory[slot] |= static_cast<uint64_t>(mask);
-                        
-                        bloom_set_bit_atomic(bloom_hash1(h));
-                        bloom_set_bit_atomic(bloom_hash2(h));
+            #pragma omp parallel reduction(+:total_tuples_sum)
+            {
+                #pragma omp for
+                for (size_t p = 0; p < num_partitions; ++p) {
+                    size_t p_count = 0;
+                    Chunk* curr = partitions[p].current_chunk;
+                    while (curr) {  //counts the num of tuples that we will save in that partition
+                        size_t n = curr->offset / sizeof(Tuple);
+                        Tuple* ts = reinterpret_cast<Tuple*>(curr->data);
+                        for (size_t i = 0; i < n; ++i) {    //traverse all the tuples
+                            uint64_t h = hash_key(ts[i].key);   //takes the hash value
+                            size_t slot = static_cast<size_t>(h & (dir_n - 1));
+                            
+                            #pragma omp atomic  //adds to directory with atomic
+                            directory[slot] += (1ULL << 16);
+                            
+                            uint16_t mask = fingerprint_to_mask(mini_hash(h));  //take the fingerprint
+                            #pragma omp atomic
+                            directory[slot] |= static_cast<uint64_t>(mask);
+                            
+                            bloom_set_bit_atomic(bloom_hash1(h));   //bloom filter update with atomic
+                            bloom_set_bit_atomic(bloom_hash2(h));
+                        }
+                        p_count += n;
+                        curr = curr->next;
                     }
-                    p_count += n;
-                    curr = curr->next;
+                    total_tuples_sum += p_count;
                 }
-                total_tuples_sum += p_count;
+            }
+
+        adjacency.resize(total_tuples_sum);     //makes the adjency array at the size of total tuples
+
+        size_t current_offset = 0;
+        for (size_t i = 0; i < dir_n; ++i) {    //prefix sum
+            uint64_t count = directory[i] >> 16;    //tuples per slot
+            uint16_t tag = static_cast<uint16_t>(directory[i] & 0xFFFFu);   //fingerprint
+            directory[i] = (static_cast<uint64_t>(current_offset) << 16) | tag;
+            current_offset += count;    //goes to next slot
+        }
+
+        #pragma omp parallel for
+        for (size_t p = 0; p < num_partitions; ++p) {   //parallel placement   
+            Chunk* curr = partitions[p].current_chunk;
+            while (curr) {  //traverse all the chunks
+                size_t n = curr->offset / sizeof(Tuple);    //total tuples
+                Tuple* ts = reinterpret_cast<Tuple*>(curr->data);
+                for (size_t i = 0; i < n; ++i) {    //traverse all the tuples
+                    uint64_t h = hash_key(ts[i].key);   //hashkey
+                    size_t slot = static_cast<size_t>(h & (dir_n - 1));     //the directory position
+                    
+                    uint64_t old_val = __atomic_fetch_add(&directory[slot], (1ULL << 16), __ATOMIC_RELAXED);    //increase the slot count    
+                    size_t target_pos = static_cast<size_t>(old_val >> 16); //the position we will write the next tuple
+                    
+                    adjacency[target_pos] = ts[i];
+                }
+                curr = curr->next;
             }
         }
 
-    adjacency.resize(total_tuples_sum);
-
-    size_t current_offset = 0;
-    for (size_t i = 0; i < dir_n; ++i) {    //prefix sum
-        uint64_t count = directory[i] >> 16;
-        uint16_t tag = static_cast<uint16_t>(directory[i] & 0xFFFFu);
-        directory[i] = (static_cast<uint64_t>(current_offset) << 16) | tag;
-        current_offset += count;
-    }
-
-    #pragma omp parallel for
-    for (size_t p = 0; p < num_partitions; ++p) {   //parallel placement   
-        Chunk* curr = partitions[p].current_chunk;
-        while (curr) {
-            size_t n = curr->offset / sizeof(Tuple);
-            Tuple* ts = reinterpret_cast<Tuple*>(curr->data);
-            for (size_t i = 0; i < n; ++i) {
-                uint64_t h = hash_key(ts[i].key);
-                size_t slot = static_cast<size_t>(h & (dir_n - 1));
-                
-                uint64_t old_val = __atomic_fetch_add(&directory[slot], (1ULL << 16), __ATOMIC_RELAXED);
-                size_t target_pos = static_cast<size_t>(old_val >> 16);
-                
-                adjacency[target_pos] = ts[i];
+        if (dir_n > 0) {    //sliding
+            for (size_t i = dir_n - 1; i > 0; --i) {
+                uint16_t current_tag = static_cast<uint16_t>(directory[i] & 0xFFFFu);
+                uint64_t prev_end_offset = directory[i-1] >> 16;
+                directory[i] = (prev_end_offset << 16) | current_tag;
             }
-            curr = curr->next;
+            directory[0] = (0ULL << 16) | (static_cast<uint16_t>(directory[0] & 0xFFFFu));
         }
+
     }
 
-    if (dir_n > 0) {    //sliding
-        for (size_t i = dir_n - 1; i > 0; --i) {
-            uint16_t current_tag = static_cast<uint16_t>(directory[i] & 0xFFFFu);
-            uint64_t prev_end_offset = directory[i-1] >> 16;
-            directory[i] = (prev_end_offset << 16) | current_tag;
+    vector<V*> find(const K& key) {
+        vector<V*> out;
+
+        if (directory.empty()) return out;  
+
+        uint64_t h = hash_key(key);
+
+        size_t slot = static_cast<size_t>(h & (directory.size() - 1));
+        uint64_t entry = directory[slot];
+
+        if (!bloom_may_contain(h)) return out;  //bloom filters use
+
+        uint16_t probe_mask = fingerprint_to_mask(mini_hash(h));
+        uint16_t slot_filter = static_cast<uint16_t>(entry & 0xFFFFu);
+        if ((slot_filter & probe_mask) != probe_mask) return out;
+
+        size_t dir_n = directory.size();
+        uint64_t start = directory[slot] >> 16;
+        uint64_t end = (slot + 1 == dir_n) ? adjacency.size() : (directory[slot + 1] >> 16);
+        out.reserve(end - start);
+
+        Tuple* ptr = adjacency.data() + start;
+        for (uint64_t i = 0; i < end - start; ++i) {    //takes the values 
+            if (ptr[i].key == key) {
+                out.push_back(&ptr[i].value);
+            }
         }
-        directory[0] = (0ULL << 16) | (static_cast<uint16_t>(directory[0] & 0xFFFFu));
+
+        return out;
     }
-
-}
-
-    std::vector<V*> find(const K& key) {
-    std::vector<V*> out;
-
-    if (directory.empty()) return out;
-
-    uint64_t h = hash_key(key);
-
-    size_t slot = static_cast<size_t>(h & (directory.size() - 1));
-    uint64_t entry = directory[slot];
-
-    if (!bloom_may_contain(h)) return out;
-
-    uint16_t probe_mask = fingerprint_to_mask(mini_hash(h));
-    uint16_t slot_filter = static_cast<uint16_t>(entry & 0xFFFFu);
-    if ((slot_filter & probe_mask) != probe_mask) return out;
-
-    size_t dir_n = directory.size();
-    uint64_t start = directory[slot] >> 16;
-    uint64_t end = (slot + 1 == dir_n) ? adjacency.size() : (directory[slot + 1] >> 16);
-    out.reserve(end - start);
-
-    Tuple* ptr = adjacency.data() + start;
-    for (uint64_t i = 0; i < end - start; ++i) {
-        if (ptr[i].key == key) {
-            out.push_back(&ptr[i].value);
-        }
-    }
-
-    return out;
-}
 
 };
