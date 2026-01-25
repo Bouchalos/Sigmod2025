@@ -197,7 +197,7 @@ public:
             }
         }
 
-        if (dir_n > 0) {    //sliding
+        if (dir_n > 0) {    //sliding for the correct offset 
             for (size_t i = dir_n - 1; i > 0; --i) {
                 uint16_t current_tag = static_cast<uint16_t>(directory[i] & 0xFFFFu);
                 uint64_t prev_end_offset = directory[i-1] >> 16;
