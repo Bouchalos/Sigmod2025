@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 4096;
+constexpr size_t CHUNK_SIZE = 512;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
@@ -273,7 +273,7 @@ struct JoinAlgorithm {
     mutex part_mutexes[num_partitions];
 
     int n = num_partitions;  // num of threads
-    constexpr size_t chunk_size = 2048;  // fixed chunk size
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
 #   pragma omp parallel
     {
@@ -335,7 +335,7 @@ struct JoinAlgorithm {
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
     atomic<size_t> global_idx(0);  //atomic counter
-    constexpr size_t grain_size = 4096;     
+    constexpr size_t grain_size = 512;     
     int num_threads = omp_get_max_threads();
 
     vector<vector<vector<value_t>>> all_thread_results(num_threads);
@@ -528,7 +528,7 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
         output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
     int threads = omp_get_max_threads(); // always use max threads
-    constexpr size_t chunk_size = 1024;  // fixed chunk size
+    constexpr size_t chunk_size = 512;  // fixed chunk size
 
 #pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
     for (size_t j = 0; j < num_cols; ++j) {
