@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 512;
+constexpr size_t CHUNK_SIZE = 1024;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
@@ -270,17 +270,22 @@ struct JoinAlgorithm {
     }
 
     PartitionAlloc level3[num_partitions];
-    mutex part_mutexes[num_partitions];
+mutex part_mutexes[num_partitions];
 
-    int n = num_partitions;  // num of threads
-    constexpr size_t chunk_size = 1024;  // fixed chunk size
+// threshold για μικρά queries
+constexpr size_t SERIAL_THRESHOLD = 4096;  
 
-#   pragma omp parallel
+bool use_parallel = build_rows >= SERIAL_THRESHOLD;
+
+// ---------- BUILD PHASE ----------
+if (use_parallel) {
+    // parallel build
+#pragma omp parallel
     {
         vector<TableTuple> local_tuples;
         local_tuples.reserve(1024);
 
-#   pragma omp for schedule(guided, chunk_size)     //collect tuples parallel
+#pragma omp for schedule(guided, 1024)
         for (size_t i = 0; i < build_rows; ++i) {
             value_t key_val = build_rel[build_col_idx].get(i);
             if (key_val.is_null()) continue;
@@ -307,7 +312,7 @@ struct JoinAlgorithm {
             }
         }
 
-        if (!local_tuples.empty()) {    
+        if (!local_tuples.empty()) {
             for (auto& tuple : local_tuples) {
                 size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (num_partitions - 1);
                 lock_guard<mutex> lock(part_mutexes[part]);
@@ -322,6 +327,50 @@ struct JoinAlgorithm {
             }
         }
     }
+} else {
+    // SERIAL build for small queries
+    vector<TableTuple> local_tuples;
+    local_tuples.reserve(1024);
+
+    for (size_t i = 0; i < build_rows; ++i) {
+        value_t key_val = build_rel[build_col_idx].get(i);
+        if (key_val.is_null()) continue;
+
+        JoinType key = key_val.int_val;
+        uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+        size_t part  = h & (num_partitions - 1);
+
+        local_tuples.push_back({key, i});
+
+        if (local_tuples.size() >= 256) {
+            for (auto& tuple : local_tuples) {
+                if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                    Chunk* c = new Chunk();
+                    c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                    c->capacity = SMALL_CHUNK_SIZE;
+                    level3[part].addSpace(c);
+                }
+                TableTuple* slot = level3[part].allocate<TableTuple>();
+                *slot = tuple;
+            }
+            local_tuples.clear();
+        }
+    }
+
+    if (!local_tuples.empty()) {
+        for (auto& tuple : local_tuples) {
+            size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (num_partitions - 1);
+            if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                Chunk* c = new Chunk();
+                c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                c->capacity = SMALL_CHUNK_SIZE;
+                level3[part].addSpace(c);
+            }
+            TableTuple* slot = level3[part].allocate<TableTuple>();
+            *slot = tuple;
+        }
+    }
+}
 
 
     UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
@@ -334,53 +383,67 @@ struct JoinAlgorithm {
     for (auto [idx, _] : output_attrs)
         accessors.push_back({idx < left.size(), idx < left.size() ? idx : idx - left.size()});
 
-    atomic<size_t> global_idx(0);  //atomic counter
-    constexpr size_t grain_size = 512;     
-    int num_threads = omp_get_max_threads();
+    // ---------- PROBE PHASE ----------
+atomic<size_t> global_idx(0);
+constexpr size_t grain_size = 1024;
 
-    vector<vector<vector<value_t>>> all_thread_results(num_threads);
-    for (int t = 0; t < num_threads; ++t) {
-        all_thread_results[t].resize(accessors.size());
-        for (size_t out = 0; out < accessors.size(); ++out)
-            all_thread_results[t][out].reserve(grain_size);
+// Αποφασίζουμε αν θα τρέξουμε parallel
+bool use_parallel_probe = probe_rows >= SERIAL_THRESHOLD;
+int num_threads = use_parallel_probe ? omp_get_max_threads() : 1;
+
+// thread-local storage για αποτελέσματα
+vector<vector<vector<value_t>>> all_thread_results(num_threads);
+for (int t = 0; t < num_threads; ++t) {
+    all_thread_results[t].resize(accessors.size());
+    for (size_t out = 0; out < accessors.size(); ++out)
+        all_thread_results[t][out].reserve(grain_size);
+}
+
+auto process_range = [&](size_t start, size_t end, int tid) {
+    auto& local = all_thread_results[tid];
+    for (size_t i = start; i < end; ++i) {
+        value_t key_val = probe_rel[probe_col_idx].get(i);
+        if (key_val.is_null()) continue;
+
+        auto matches = hash_table.find(key_val.int_val);
+        for (size_t* match_ptr : matches) {
+            size_t match_idx = *match_ptr;
+            size_t left_row  = build_left ? match_idx : i;
+            size_t right_row = build_left ? i         : match_idx;
+
+            for (size_t out = 0; out < accessors.size(); ++out)
+                local[out].push_back(accessors[out].from_left
+                                    ? left[accessors[out].col].get(left_row)
+                                    : right[accessors[out].col].get(right_row));
+        }
     }
+};
 
-#pragma omp parallel    //parallel probe, with thread stealing (dynamic)
-        {
-            int tid = omp_get_thread_num(); 
-            auto& local = all_thread_results[tid];
-
-            while (true) {
-                size_t start = global_idx.fetch_add(grain_size, memory_order_relaxed);
-                if (start >= probe_rows) break;
-                size_t end = min(start + grain_size, probe_rows);
-
-                for (size_t i = start; i < end; ++i) {
-                    value_t key_val = probe_rel[probe_col_idx].get(i);
-                    if (key_val.is_null()) continue;
-
-                    auto matches = hash_table.find(key_val.int_val);
-                    for (size_t* match_ptr : matches) {
-                        size_t match_idx = *match_ptr;
-
-                        size_t left_row  = build_left ? match_idx : i;
-                        size_t right_row = build_left ? i         : match_idx;
-
-                        for (size_t out = 0; out < accessors.size(); ++out)
-                            local[out].push_back(accessors[out].from_left
-                                                ? left[accessors[out].col].get(left_row)
-                                                : right[accessors[out].col].get(right_row));
-                    }
-                }
-            }
+if (use_parallel_probe) {
+    // parallel probe with thread stealing
+#pragma omp parallel num_threads(num_threads)
+    {
+        int tid = omp_get_thread_num();
+        while (true) {
+            size_t start = global_idx.fetch_add(grain_size, memory_order_relaxed);
+            if (start >= probe_rows) break;
+            size_t end = std::min(start + grain_size, probe_rows);
+            process_range(start, end, tid);
         }
+    }
+} else {
+    // SERIAL probe for small queries
+    process_range(0, probe_rows, 0);
+}
 
-        for (size_t out = 0; out < accessors.size(); ++out) {   //single threaded aggeration
-            for (int t = 0; t < num_threads; ++t) {
-                for (auto& v : all_thread_results[t][out])
-                    results[out].append(v);
-            }
-        }
+// ---------- AGGREGATE THREAD RESULTS ----------
+for (size_t out = 0; out < accessors.size(); ++out) {
+    for (int t = 0; t < num_threads; ++t) {
+        for (auto& v : all_thread_results[t][out])
+            results[out].append(v);
+    }
+}
+
     }
 };
 
@@ -528,7 +591,7 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
         output_table.columns.emplace_back(get<1>(plan.nodes[plan.root].output_attrs[j]));
 
     int threads = omp_get_max_threads(); // always use max threads
-    constexpr size_t chunk_size = 512;  // fixed chunk size
+    constexpr size_t chunk_size = 1024;  // fixed chunk size
 
 #pragma omp parallel for schedule(guided) num_threads(threads)  // parallel per-column guided schedule
     for (size_t j = 0; j < num_cols; ++j) {
@@ -574,9 +637,6 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
 
     return output_table;
 }
-
-
-
 
 
 void* build_context() { return nullptr; }
