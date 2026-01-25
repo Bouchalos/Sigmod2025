@@ -34,11 +34,11 @@ struct value_t {
         StringIndex str_index;
     };
 
-    inline value_t() noexcept : type(NULL_VAL), int_val(0) {}
-    inline value_t(int32_t v) noexcept : type(INT32), int_val(v) {}
-    inline value_t(const StringIndex& s) noexcept : type(VARCHAR), str_index(s) {}
+    value_t() : type(NULL_VAL), int_val(0) {}
+    value_t(int32_t v) : type(INT32), int_val(v) {}
+    value_t(StringIndex s) : type(VARCHAR), str_index(s) {}
 
-    inline bool is_null() const noexcept { return type == NULL_VAL; }
+    bool is_null() const { return type == NULL_VAL; }
 };
 
 namespace Contest {
@@ -60,11 +60,9 @@ struct PagedColumn {
     uint32_t view_rows_per_page = 0;
 
     void append(const value_t& val) {
-        // Χρήση bitwise αντί για % και / (CHUNK_SIZE = 1024)
         size_t offset = total_size & (CHUNK_SIZE - 1); 
         
-        if (offset == 0) { // Χρειάζεται νέα σελίδα
-            // Χρήση default initialization (όχι zero-init) για ταχύτητα
+        if (offset == 0) { 
             pages.emplace_back(new value_t[CHUNK_SIZE]);
             capacity += CHUNK_SIZE;
         }
@@ -88,20 +86,16 @@ struct PagedColumn {
     }
 
 
-    inline value_t get(size_t idx) const noexcept {
-    if (is_view) {
-        const size_t page_idx = idx / view_rows_per_page;
-        const size_t offset   = idx % view_rows_per_page;
-        value_t v;
-        v.type = value_t::INT32;
-        v.int_val = view_chunks[page_idx][offset];
-        return v;
+    inline value_t get(size_t idx) const {
+        if (is_view) {
+            size_t page_idx = idx / view_rows_per_page;
+            size_t offset   = idx % view_rows_per_page;
+            return value_t(view_chunks[page_idx][offset]);
+        }
+        size_t page_idx = idx / CHUNK_SIZE; 
+        size_t offset   = idx % CHUNK_SIZE; 
+        return pages[page_idx][offset];
     }
-    const size_t page_idx = idx >> 10;          // /1024
-    const size_t offset   = idx & (CHUNK_SIZE-1);
-    return pages[page_idx][offset];
-}
-
 
     size_t size() const { return total_size; }
 };
@@ -110,143 +104,139 @@ using ExecuteResult = std::vector<PagedColumn>;
 
 ExecuteResult execute_impl(const Plan& plan, size_t node_idx);
 
-inline bool get_bitmap_at(const uint8_t* __restrict bitmap, uint16_t idx) noexcept {
-    return bitmap[idx >> 3] & (1u << (idx & 7));
+inline bool get_bitmap_at(const uint8_t* bitmap, uint16_t idx) {
+    return bitmap[idx / 8] & (1u << (idx % 8));
 }
-
 
 struct ColumnCursor {
     const Column* column_ptr;
-    size_t page_idx;
+    size_t         page_idx;
     const uint8_t* page_data;
-
-    uint16_t num_rows_in_page;
-    uint16_t current_row;
-    uint16_t non_null_idx;
-
-    uint16_t table_id;
-    uint16_t col_id;
-    DataType type;
-    size_t num_pages;
+    uint16_t       num_rows_in_page;
+    uint16_t       current_row_in_page; 
+    uint16_t       non_null_idx; 
+    
+    uint16_t       table_id;
+    uint16_t       col_id;
+    DataType       type;
+    size_t         num_pages;
 
     const uint8_t* bitmap_ptr;
-    const uint8_t* data_ptr;
-    const uint16_t* offsets_ptr;
-    const char* chars_ptr;
+    const uint8_t* data_start_ptr; 
+    const uint16_t* offsets_ptr;    
+    const char* chars_base_ptr; 
 
-    inline ColumnCursor(const ColumnarTable& table,
-                        uint16_t t_id,
-                        uint16_t c_id,
-                        DataType t) noexcept
-        : column_ptr(&table.columns[c_id]),
-          page_idx(0),
-          table_id(t_id),
-          col_id(c_id),
-          type(t) {
+    ColumnCursor(const ColumnarTable& table, size_t t_id, size_t c_id, DataType t) 
+        : column_ptr(&table.columns[c_id]), page_idx(0), 
+          table_id(t_id), col_id(c_id), type(t) {
+        
         num_pages = column_ptr->pages.size();
         load_page(0);
     }
 
-    inline void load_page(size_t idx) noexcept {
+    void load_page(size_t idx) {
         page_idx = idx;
-        current_row = 0;
+        current_row_in_page = 0;
         non_null_idx = 0;
 
-        if (idx >= num_pages) {
-            page_data = nullptr;
-            return;
-        }
+        if (page_idx < num_pages) {
+            page_data = reinterpret_cast<const uint8_t*>(column_ptr->pages[page_idx]->data);
+            num_rows_in_page = *reinterpret_cast<const uint16_t*>(page_data);
+            
+            if (type == DataType::VARCHAR && (num_rows_in_page == 0xFFFF || num_rows_in_page == 0xFFFE)) {
+                bitmap_ptr = nullptr;
+                offsets_ptr = nullptr;
+                return; 
+            }
 
-        page_data = reinterpret_cast<const uint8_t*>(column_ptr->pages[idx]->data);
-        num_rows_in_page = *reinterpret_cast<const uint16_t*>(page_data);
+            size_t bitmap_size = (num_rows_in_page + 7) / 8;
+            bitmap_ptr = page_data + PAGE_SIZE - bitmap_size;
 
-        if (type == DataType::VARCHAR &&
-           (num_rows_in_page == 0xFFFF || num_rows_in_page == 0xFFFE)) {
-            bitmap_ptr = nullptr;
-            return;
-        }
-
-        bitmap_ptr = page_data + PAGE_SIZE - ((num_rows_in_page + 7) >> 3);
-
-        if (type == DataType::INT32) {
-            data_ptr = page_data + 4;
+            if (type == DataType::INT32) {
+                data_start_ptr = page_data + 4;
+            } else if (type == DataType::VARCHAR) {
+                uint16_t num_offsets = *reinterpret_cast<const uint16_t*>(page_data + 2);
+                offsets_ptr = reinterpret_cast<const uint16_t*>(page_data + 4);
+                chars_base_ptr = reinterpret_cast<const char*>(page_data + 4 + num_offsets * 2);
+            }
         } else {
-            const uint16_t num_offsets = *reinterpret_cast<const uint16_t*>(page_data + 2);
-            offsets_ptr = reinterpret_cast<const uint16_t*>(page_data + 4);
-            chars_ptr   = reinterpret_cast<const char*>(page_data + 4 + num_offsets * 2);
+            page_data = nullptr;
         }
     }
 
-    inline void advance_page() noexcept {
+    void advance_page() {
         load_page(page_idx + 1);
     }
 
-    inline value_t next() noexcept {
-        for (;;) {
-            if (!page_data) return value_t();
+    value_t next() {
+        while (true) { 
+            if (!page_data) return value_t(); 
 
-            // continuation page
             if (type == DataType::VARCHAR && num_rows_in_page == 0xFFFE) {
                 advance_page();
                 continue;
             }
 
-            // long string start
             if (type == DataType::VARCHAR && num_rows_in_page == 0xFFFF) {
+                uint16_t chunk_len = *reinterpret_cast<const uint16_t*>(page_data + 2);
+                StringIndex idx;
+                idx.table_id = table_id;
+                idx.col_id   = col_id;
+                idx.page_id  = page_idx; 
+                idx.offset   = 4; 
+                idx.length   = 0; 
+
+                advance_page(); 
+                return value_t(idx);
+            }
+
+            if (current_row_in_page >= num_rows_in_page) {
+                advance_page();
+                continue; 
+            }
+
+            bool is_valid = false;
+            if (bitmap_ptr) {
+                is_valid = get_bitmap_at(bitmap_ptr, current_row_in_page);
+            }
+            current_row_in_page++;
+
+            if (!is_valid) {
+                return value_t(); 
+            }
+
+            if (type == DataType::INT32) {
+                const int32_t* arr = reinterpret_cast<const int32_t*>(data_start_ptr);
+                int32_t val = arr[non_null_idx++];
+                return value_t(val);
+
+            } else if (type == DataType::VARCHAR) {
+                uint16_t end_offset = offsets_ptr[non_null_idx];
+                uint16_t start_offset = (non_null_idx == 0) ? 0 : offsets_ptr[non_null_idx - 1];
+                uint16_t len = end_offset - start_offset;
+                
+                uint64_t base_delta = reinterpret_cast<const uint8_t*>(chars_base_ptr) - page_data;
+                uint32_t final_offset = static_cast<uint32_t>(base_delta) + static_cast<uint32_t>(start_offset);
+
+                if (final_offset + len > PAGE_SIZE) {
+                    advance_page();
+                    continue; 
+                }
+
+                non_null_idx++;
+
                 StringIndex idx;
                 idx.table_id = table_id;
                 idx.col_id   = col_id;
                 idx.page_id  = page_idx;
-                idx.offset   = 4;
-                idx.length   = 0;
-                advance_page();
+                idx.offset   = final_offset;
+                idx.length   = len;
+
                 return value_t(idx);
             }
-
-            if (current_row >= num_rows_in_page) {
-                advance_page();
-                continue;
-            }
-
-            const bool valid = bitmap_ptr
-                ? get_bitmap_at(bitmap_ptr, current_row)
-                : true;
-
-            current_row++;
-
-            if (!valid) return value_t();
-
-            if (type == DataType::INT32) {
-                const int32_t* arr = reinterpret_cast<const int32_t*>(data_ptr);
-                return value_t(arr[non_null_idx++]);
-            }
-
-            // VARCHAR
-            const uint16_t end = offsets_ptr[non_null_idx];
-            const uint16_t start = (non_null_idx == 0) ? 0 : offsets_ptr[non_null_idx - 1];
-            const uint16_t len = end - start;
-
-            const uint32_t base =
-                static_cast<uint32_t>(reinterpret_cast<const uint8_t*>(chars_ptr) - page_data);
-
-            if (base + start + len > PAGE_SIZE) {
-                advance_page();
-                continue;
-            }
-
-            StringIndex idx;
-            idx.table_id = table_id;
-            idx.col_id   = col_id;
-            idx.page_id  = page_idx;
-            idx.offset   = base + start;
-            idx.length   = len;
-
-            non_null_idx++;
-            return value_t(idx);
         }
     }
 };
-
 
 struct JoinAlgorithm {
     bool                                             build_left;
@@ -257,29 +247,43 @@ struct JoinAlgorithm {
     const std::vector<std::tuple<size_t, DataType>>& output_attrs;
 
     void run() {
-        using JoinType   = int32_t;
-        using TableTuple = typename UnchainedHashTable<JoinType, size_t>::Tuple;
+    using JoinType   = int32_t;
+    using TableTuple = typename UnchainedHashTable<JoinType, size_t>::Tuple;
 
-        auto& build_rel = build_left ? left : right;
-        auto& probe_rel = build_left ? right : left;
+    auto& build_rel = build_left ? left : right;
+    auto& probe_rel = build_left ? right : left;
 
-        size_t build_col_idx = build_left ? left_col  : right_col;
-        size_t probe_col_idx = build_left ? right_col : left_col;
+    size_t build_col_idx = build_left ? left_col  : right_col;
+    size_t probe_col_idx = build_left ? right_col : left_col;
 
-        results.resize(output_attrs.size());
+    results.resize(output_attrs.size());
 
-        size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
-        size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
+    size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
+    size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
-        constexpr size_t numPartitions = 32;
+    size_t build_probe_size = std::max(build_rows, probe_rows);
+    size_t numPartitions = 1; // default για πολύ μικρό join
+    if (build_probe_size > 0) {
+        // θέλουμε περίπου 1 partition ανά 4096 rows (μπορείς να ρυθμίσεις)
+        numPartitions = std::min<size_t>(64, std::max<size_t>(1, build_probe_size / 4096));
+        // στρογγυλοποίηση στην επόμενη δύναμη του 2 για καλύτερη bitmask
+        size_t p = 1;
+        while (p < numPartitions) p <<= 1;
+        numPartitions = p;
+    }
 
-        PartitionAlloc level3[numPartitions];
-        std::mutex part_mutexes[numPartitions];
+    PartitionAlloc level3[numPartitions];
+    std::mutex part_mutexes[numPartitions];
 
-        /* ============================================================
-         * 1. BUILD PHASE (same logic, better hashing)
-         * ============================================================ */
-#pragma omp parallel for schedule(static)
+    /* ============================================================
+     * 1. BUILD PHASE - thread-local allocation
+     * ============================================================ */
+#pragma omp parallel
+    {
+        std::vector<TableTuple> local_tuples;
+        local_tuples.reserve(1024);
+
+#pragma omp for schedule(static)
         for (size_t i = 0; i < build_rows; ++i) {
             value_t key_val = build_rel[build_col_idx].get(i);
             if (key_val.is_null()) continue;
@@ -288,100 +292,136 @@ struct JoinAlgorithm {
             uint32_t h   = _mm_crc32_u32(0, static_cast<uint32_t>(key));
             size_t part  = h & (numPartitions - 1);
 
-            std::lock_guard<std::mutex> lock(part_mutexes[part]);
+            TableTuple t{key, i};
+            local_tuples.push_back(t);
 
-            if (level3[part].freeSpace() < sizeof(TableTuple)) {
-                Chunk* c   = new Chunk();
-                c->data     = new uint8_t[SMALL_CHUNK_SIZE];
-                c->capacity = SMALL_CHUNK_SIZE;
-                level3[part].addSpace(c);
+            if (local_tuples.size() >= 256) {
+                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                for (auto& tuple : local_tuples) {
+                    if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                        Chunk* c = new Chunk();
+                        c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                        c->capacity = SMALL_CHUNK_SIZE;
+                        level3[part].addSpace(c);
+                    }
+                    TableTuple* slot = level3[part].allocate<TableTuple>();
+                    *slot = tuple;
+                }
+                local_tuples.clear();
             }
-
-            TableTuple* t = level3[part].allocate<TableTuple>();
-            t->key   = key;
-            t->value = i;
         }
 
-        /* ============================================================
-         * 2. BUILD HASH TABLE
-         * ============================================================ */
-        UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
-        hash_table.build_from_slabs(level3, numPartitions);
-
-        /* ============================================================
-         * 3. PRECOMPUTE OUTPUT ACCESSORS
-         * ============================================================ */
-        struct OutputAccessor {
-            bool   from_left;
-            size_t col;
-        };
-
-        std::vector<OutputAccessor> accessors;
-        accessors.reserve(output_attrs.size());
-
-        for (auto [idx, _] : output_attrs) {
-            if (idx < left.size())
-                accessors.push_back({true, idx});
-            else
-                accessors.push_back({false, idx - left.size()});
+        // flush remaining
+        if (!local_tuples.empty()) {
+            for (auto& tuple : local_tuples) {
+                size_t part = _mm_crc32_u32(0, static_cast<uint32_t>(tuple.key)) & (numPartitions-1);
+                std::lock_guard<std::mutex> lock(part_mutexes[part]);
+                if (level3[part].freeSpace() < sizeof(TableTuple)) {
+                    Chunk* c = new Chunk();
+                    c->data = new uint8_t[SMALL_CHUNK_SIZE];
+                    c->capacity = SMALL_CHUNK_SIZE;
+                    level3[part].addSpace(c);
+                }
+                TableTuple* slot = level3[part].allocate<TableTuple>();
+                *slot = tuple;
+            }
         }
+    }
 
-        /* ============================================================
-         * 4. PROBE PHASE
-         * ============================================================ */
-        std::atomic<size_t> global_row_idx(0);
-        constexpr size_t grain_size = 1024;
+    /* ============================================================
+     * 2. BUILD HASH TABLE
+     * ============================================================ */
+    UnchainedHashTable<JoinType, size_t> hash_table(build_rows);
+    hash_table.build_from_slabs(level3, numPartitions);
 
-        int num_threads = omp_get_max_threads();
-        std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
+    /* ============================================================
+     * 3. PRECOMPUTE OUTPUT ACCESSORS
+     * ============================================================ */
+    struct OutputAccessor {
+        bool from_left;
+        size_t col;
+    };
+
+    std::vector<OutputAccessor> accessors;
+    accessors.reserve(output_attrs.size());
+    for (auto [idx, _] : output_attrs) {
+        if (idx < left.size())
+            accessors.push_back({true, idx});
+        else
+            accessors.push_back({false, idx - left.size()});
+    }
+
+    /* ============================================================
+     * 4. PROBE PHASE
+     * ============================================================ */
+    std::atomic<size_t> global_idx(0);
+    constexpr size_t grain_size = 4096; // bigger grain to reduce fetch_add contention
+    int num_threads = omp_get_max_threads();
+
+    // preallocate thread-local results
+    std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        all_thread_results[t].resize(accessors.size());
+        for (size_t out = 0; out < accessors.size(); ++out)
+            all_thread_results[t][out].reserve(grain_size); // rough estimate
+    }
 
 #pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-            auto& local = all_thread_results[tid];
-            local.resize(accessors.size());
+    {
+        int tid = omp_get_thread_num();
+        auto& local = all_thread_results[tid];
 
-            while (true) {
-                size_t start = global_row_idx.fetch_add(grain_size);
-                if (start >= probe_rows) break;
-                size_t end = std::min(start + grain_size, probe_rows);
+        while (true) {
+            size_t start = global_idx.fetch_add(grain_size);
+            if (start >= probe_rows) break;
+            size_t end = std::min(start + grain_size, probe_rows);
 
-                for (size_t i = start; i < end; ++i) {
-                    value_t key_val = probe_rel[probe_col_idx].get(i);
-                    if (key_val.is_null()) continue;
+            for (size_t i = start; i < end; ++i) {
+                value_t key_val = probe_rel[probe_col_idx].get(i);
+                if (key_val.is_null()) continue;
 
-                    auto matches = hash_table.find(key_val.int_val);
+                auto matches = hash_table.find(key_val.int_val);
+                for (size_t* match_ptr : matches) {
+                    size_t match_idx = *match_ptr;
 
-                    for (size_t* match_ptr : matches) {
-                        size_t match_idx = *match_ptr;
+                    size_t left_row  = build_left ? match_idx : i;
+                    size_t right_row = build_left ? i         : match_idx;
 
-                        size_t left_row  = build_left ? match_idx : i;
-                        size_t right_row = build_left ? i         : match_idx;
-
-                        for (size_t out = 0; out < accessors.size(); ++out) {
-                            const auto& acc = accessors[out];
-                            value_t v = acc.from_left
-                                ? left [acc.col].get(left_row)
-                                : right[acc.col].get(right_row);
-
-                            local[out].push_back(v);
+                    for (size_t out = 0; out < accessors.size(); ++out) {
+                        const auto& acc = accessors[out];
+                        if (acc.from_left) {
+                            local[out].push_back(left[acc.col].get(left_row));
+                        } else {
+                            local[out].push_back(right[acc.col].get(right_row));
                         }
                     }
                 }
             }
         }
+    }
 
-        /* ============================================================
-         * 5. FINAL AGGREGATION
-         * ============================================================ */
+    /* ============================================================
+     * 5. PARALLEL FINAL AGGREGATION
+     * ============================================================ */
+#pragma omp parallel for schedule(static)
+    for (size_t out = 0; out < accessors.size(); ++out) {
+        // estimate total size for vector to avoid realloc
+        size_t total = 0;
+        for (int t = 0; t < num_threads; ++t)
+            total += all_thread_results[t][out].size();
+
+        size_t estimated_pages = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        results[out].pages.reserve(estimated_pages);  // reserve vector για pages
+
         for (int t = 0; t < num_threads; ++t) {
-            for (size_t out = 0; out < accessors.size(); ++out) {
-                for (auto& v : all_thread_results[t][out]) {
-                    results[out].append(v);
-                }
+            auto& local_vec = all_thread_results[t][out];
+            for (auto& v : local_vec) {
+                results[out].append(v);
             }
         }
     }
+}
+
 };
 
 
