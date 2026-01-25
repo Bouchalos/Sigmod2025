@@ -261,12 +261,13 @@ struct JoinAlgorithm {
     size_t build_rows = build_rel.empty() ? 0 : build_rel[0].size();
     size_t probe_rows = probe_rel.empty() ? 0 : probe_rel[0].size();
 
+    // ------------------------
+    // Adaptive partitions
+    // ------------------------
     size_t build_probe_size = std::max(build_rows, probe_rows);
     size_t numPartitions = 1; // default για πολύ μικρό join
     if (build_probe_size > 0) {
-        // θέλουμε περίπου 1 partition ανά 4096 rows (μπορείς να ρυθμίσεις)
         numPartitions = std::min<size_t>(64, std::max<size_t>(1, build_probe_size / 4096));
-        // στρογγυλοποίηση στην επόμενη δύναμη του 2 για καλύτερη bitmask
         size_t p = 1;
         while (p < numPartitions) p <<= 1;
         numPartitions = p;
@@ -352,18 +353,17 @@ struct JoinAlgorithm {
     }
 
     /* ============================================================
-     * 4. PROBE PHASE
+     * 4. THREAD-LOCAL PROBE PHASE WITH WORK STEALING
      * ============================================================ */
     std::atomic<size_t> global_idx(0);
-    constexpr size_t grain_size = 4096; // bigger grain to reduce fetch_add contention
+    constexpr size_t grain_size = 4096;
     int num_threads = omp_get_max_threads();
 
-    // preallocate thread-local results
     std::vector<std::vector<std::vector<value_t>>> all_thread_results(num_threads);
     for (int t = 0; t < num_threads; ++t) {
         all_thread_results[t].resize(accessors.size());
         for (size_t out = 0; out < accessors.size(); ++out)
-            all_thread_results[t][out].reserve(grain_size); // rough estimate
+            all_thread_results[t][out].reserve(grain_size);
     }
 
 #pragma omp parallel
@@ -372,7 +372,8 @@ struct JoinAlgorithm {
         auto& local = all_thread_results[tid];
 
         while (true) {
-            size_t start = global_idx.fetch_add(grain_size);
+            // Work stealing: κάθε thread παίρνει το επόμενο chunk από global index
+            size_t start = global_idx.fetch_add(grain_size, std::memory_order_relaxed);
             if (start >= probe_rows) break;
             size_t end = std::min(start + grain_size, probe_rows);
 
@@ -389,38 +390,27 @@ struct JoinAlgorithm {
 
                     for (size_t out = 0; out < accessors.size(); ++out) {
                         const auto& acc = accessors[out];
-                        if (acc.from_left) {
-                            local[out].push_back(left[acc.col].get(left_row));
-                        } else {
-                            local[out].push_back(right[acc.col].get(right_row));
-                        }
+                        local[out].push_back(acc.from_left ? left[acc.col].get(left_row)
+                                                           : right[acc.col].get(right_row));
                     }
                 }
             }
         }
-    }
+    } // end parallel probe
 
     /* ============================================================
-     * 5. PARALLEL FINAL AGGREGATION
+     * 5. SINGLE-THREADED AGGREGATION
      * ============================================================ */
-#pragma omp parallel for schedule(static)
     for (size_t out = 0; out < accessors.size(); ++out) {
-        // estimate total size for vector to avoid realloc
-        size_t total = 0;
-        for (int t = 0; t < num_threads; ++t)
-            total += all_thread_results[t][out].size();
-
-        size_t estimated_pages = (total + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        results[out].pages.reserve(estimated_pages);  // reserve vector για pages
-
         for (int t = 0; t < num_threads; ++t) {
             auto& local_vec = all_thread_results[t][out];
-            for (auto& v : local_vec) {
+            for (auto& v : local_vec)
                 results[out].append(v);
-            }
         }
     }
 }
+
+
 
 };
 
@@ -579,32 +569,52 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
     ColumnarTable output_table;
     output_table.num_rows = num_rows;
     
-    // Κάνουμε reserve για να μην έχουμε reallocations, 
-    // αλλά ΔΕΝ κάνουμε resize γιατί η Column δεν αντιγράφεται.
     output_table.columns.reserve(num_cols);
     for(size_t j = 0; j < num_cols; ++j) {
         auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
         output_table.columns.emplace_back(type); 
     }
 
-    // Τώρα το παράλληλο loop δουλεύει πάνω στα ήδη υπάρχοντα αντικείμενα
-    #pragma omp parallel for schedule(dynamic)
+    // ---------------------------
+    // Determine number of threads dynamically
+    // ---------------------------
+    int max_threads = omp_get_max_threads();
+    int num_threads = 1; // default single-threaded for very small datasets
+
+    if (num_rows > 8192) {
+        // scale linearly: 1 thread / 4096 rows (adjust threshold as needed)
+        num_threads = static_cast<int>(std::min<size_t>(max_threads, (num_rows + 4095) / 4096));
+    }
+
+    // ---------------------------
+    // Parallel column population
+    // ---------------------------
+    #pragma omp parallel for schedule(dynamic) num_threads(num_threads)
     for(size_t j = 0; j < num_cols; ++j) {
         auto type = std::get<1>(plan.nodes[plan.root].output_attrs[j]);
-        auto& src_paged_col = columns[j];
-        auto& out_col = output_table.columns[j]; // Πρόσβαση στην ήδη έτοιμη Column
+        auto& src = columns[j];
+        auto& dst = output_table.columns[j];
 
         if (type == DataType::INT32) {
-            ColumnInserter<int32_t> inserter(out_col);
-            
-            if (src_paged_col.is_view) {
-                uint32_t rows_per_pg = src_paged_col.view_rows_per_page;
-                for (size_t i = 0; i < num_rows; ++i) {
-                    inserter.insert(src_paged_col.view_chunks[i / rows_per_pg][i % rows_per_pg]);
+            ColumnInserter<int32_t> inserter(dst);
+
+            if (src.is_view) {
+                uint32_t rows_per_pg = src.view_rows_per_page;
+                size_t num_pages = src.view_chunks.size();
+
+                for (size_t pg = 0; pg < num_pages; ++pg) {
+                    const int32_t* chunk = src.view_chunks[pg];
+                    size_t start = pg * rows_per_pg;
+                    size_t end   = std::min(start + rows_per_pg, num_rows);
+
+                    #pragma omp simd
+                    for (size_t i = start; i < end; ++i)
+                        inserter.insert(chunk[i - start]);
                 }
             } else {
+                #pragma omp simd
                 for (size_t i = 0; i < num_rows; ++i) {
-                    value_t val = src_paged_col.get(i);
+                    value_t val = src.get(i);
                     if (val.is_null()) inserter.insert_null();
                     else inserter.insert(val.int_val);
                 }
@@ -612,9 +622,10 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
             inserter.finalize();
         } 
         else if (type == DataType::VARCHAR) {
-            ColumnInserter<std::string> inserter(out_col);
+            ColumnInserter<std::string> inserter(dst);
+
             for (size_t i = 0; i < num_rows; ++i) {
-                value_t val = src_paged_col.get(i);
+                value_t val = src.get(i);
                 if (val.is_null()) inserter.insert_null();
                 else inserter.insert(materialize_string(val, plan));
             }
@@ -624,6 +635,7 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
 
     return output_table;
 }
+
 
 void* build_context() { return nullptr; }
 void destroy_context([[maybe_unused]] void* context) {}
