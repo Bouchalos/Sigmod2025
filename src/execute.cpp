@@ -622,36 +622,15 @@ ColumnarTable execute(const Plan& plan, [[maybe_unused]] void* context) {
             inserter.finalize();
         } 
         else if (type == DataType::VARCHAR) {
-    ColumnInserter<std::string> inserter(dst);
-    
-    // Προ-υπολογισμός αν πρόκειται για μεγάλο όγκο δεδομένων
-    for (size_t i = 0; i < num_rows; ++i) {
-        value_t val = src.get(i);
-        if (val.is_null()) {
-            inserter.insert_null();
-        } else {
-            // Αντί για materialize_string που φτιάχνει std::string object,
-            // γράψε απευθείας από τη μνήμη της πηγής.
-            StringIndex idx = val.str_index;
-            const auto& col_src = plan.inputs[idx.table_id].columns[idx.col_id];
-            const uint8_t* page_data = reinterpret_cast<const uint8_t*>(col_src.pages[idx.page_id]->data);
-            
-            // Fast path για απλά strings (όχι multi-page)
-            if (*reinterpret_cast<const uint16_t*>(page_data) != 0xFFFF) {
-                const char* ptr = reinterpret_cast<const char*>(page_data) + idx.offset;
-                size_t len = idx.length;
-                if (len > 0 && ptr[len - 1] == '\0') len--;
-                
-                // Χρήση string_view για να μην γίνει allocation πριν το insert
-                inserter.insert(std::string(ptr, len)); 
-            } else {
-                // Slow path για multi-page strings
-                inserter.insert(materialize_string(val, plan));
+            ColumnInserter<std::string> inserter(dst);
+
+            for (size_t i = 0; i < num_rows; ++i) {
+                value_t val = src.get(i);
+                if (val.is_null()) inserter.insert_null();
+                else inserter.insert(materialize_string(val, plan));
             }
+            inserter.finalize();
         }
-    }
-    inserter.finalize();
-}
     }
 
     return output_table;
