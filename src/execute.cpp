@@ -49,7 +49,7 @@ struct PageHeader {
     uint16_t val_count;
 };
 
-constexpr size_t CHUNK_SIZE = 1024;
+constexpr size_t CHUNK_SIZE = 4096;
 
 struct PagedColumn {
     vector<unique_ptr<value_t[]>> pages;
@@ -273,7 +273,7 @@ struct JoinAlgorithm {
     mutex part_mutexes[num_partitions];
 
     int n = num_partitions;  // num of threads
-    constexpr size_t chunk_size = 1024;  // fixed chunk size
+    constexpr size_t chunk_size = 2048;  // fixed chunk size
 
 #   pragma omp parallel
     {
