@@ -1,181 +1,117 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/gjaw_qSU)
-# SIGMOD Contest 2025
+# High-Performance Join Engine
 
-## Task
+This repository contains the final version of my course project for **Software Development for Information Systems** (Winter Semester 2025-2026), based on the **SIGMOD 2025 programming contest**.
 
-Given the joining pipeline and the pre-filtered input data, your task is to implement an efficient joining algorithm to accelerate the execution time of the joining pipeline. Specifically, you need to implement the following function in `src/execute.cpp`:
+The goal of the project was to speed up the execution of a relational join pipeline as much as possible. Starting from a baseline implementation that used `std::unordered_map`, I gradually redesigned the execution path by focusing on data layout, hash table design, and parallel execution. The final version reduced execution time from **190,469 ms** to **9,475 ms**.
 
-```C++
-ColumnarTable execute(const Plan& plan, void* context);
-```
+## What I implemented
 
-Optionally, you can implement these two functions as well to prepare any global context (e.g., thread pool) to accelerate the execution.
+The project evolved through a few main optimization steps:
 
-```C++
-void* build_context();
-void destroy_context(void*);
-```
+### 1. Custom hash tables
+I first replaced `std::unordered_map` with custom hash table implementations written from scratch:
+- Hopscotch hashing
+- Cuckoo hashing
+- Robin Hood hashing
 
-### Input format
+Among these, **Robin Hood hashing** combined with the **DJB2** hash function gave the best early improvement.
 
-The input plan in the above function is defined as the following struct.
+### 2. Late materialization
+One of the biggest bottlenecks was handling strings during intermediate joins. To avoid repeated string copying, I introduced a custom **64-bit `value_t` representation**. Intermediate join results are stored in this compact form, and actual strings are materialized only at the end of execution.
 
-```C++
-struct ScanNode {
-    size_t base_table_id;
-};
+This significantly reduced overhead and made later stages much faster.
 
-struct JoinNode {
-    bool   build_left;
-    size_t left;
-    size_t right;
-    size_t left_attr;
-    size_t right_attr;
-};
+### 3. Column-store layout
+I changed the internal representation from a row-oriented layout to a **column-oriented layout**. I used a paged column structure to improve cache locality and reduce unnecessary memory traffic during joins.
 
-struct PlanNode {
-    std::variant<ScanNode, JoinNode>          data;
-    std::vector<std::tuple<size_t, DataType>> output_attrs;
-};
+After experimenting with different page sizes, I found that **4096-byte pages** worked best for this implementation.
 
-struct Plan {
-    std::vector<PlanNode>      nodes;
-    std::vector<ColumnarTable> inputs;
-    size_t root;
-}
-```
+### 4. Unchained hash table
+I also implemented the **Unchained Hash Table** described in the assignment paper. It uses a Bloom filter for fast key existence checks and stores duplicate keys in the same slot, which helped improve join performance further.
 
-**Scan**:
-- The `base_table_id` member refers to which input table in the `inputs` member of a plan is used by the Scan node.
-- Each item in the `output_attrs` indicates which column in the base table should be output and what type it is.
+### 5. Parallel execution with OpenMP
+In the final stage, I parallelized the most expensive parts of the pipeline using **OpenMP**:
+- hash table build phase
+- probe phase
+- final materialization phase
 
-**Join**:
-- The `build_left` member refers to which side the hash table should be built on, where `true` indicates building the hash table on the left child, and `false` indicates the opposite.
-- The `left` and `right` members are the indexes of the left and right child of the Join node in the `nodes` member of a plan, respectively.
-- The `left_attr` and `right_attr` members are the join condition of Join node. Supposing that there are two records, `left_record` and `right_record`, from the intermediate results of the left and right child, respectively. The members indicate that the two records should be joined when `left_record[left_attr] == right_record[right_attr]`.
-- Each item in the `output_attrs` indicates which column in the result of children should be output and what type it is. Supposing that the left child has $n_l$ columns and the right child has $n_r$ columns, the value of the index $i \in \{0, \dots, n_l + n_r - 1\}$, where the ranges $\{0, \dots, n_l - 1\}$ and $\{n_l, \dots, n_l + n_r - 1\}$ indicate the output column is from left and right child respectively.
+I also used work stealing / dynamic scheduling ideas so that threads could keep working instead of sitting idle.
 
-**Root**: The `root` member of a plan indicates which node is the root node of the execution plan tree.
+## Results
 
-### Data format
+All experiments were run on **Ubuntu 22.04** on a machine with:
+- **Intel Core i7** (10 cores / 16 threads)
+- **32 GB RAM**
 
-The input and output data both follow a simple columnar data format.
+Execution time improved as follows:
 
-```C++
-enum class DataType {
-    INT32,       // 4-byte integer
-    INT64,       // 8-byte integer
-    FP64,        // 8-byte floating point
-    VARCHAR,     // string of arbitary length
-};
+| Version | Execution Time |
+|---|---:|
+| Baseline (`std::unordered_map`) | 190,469 ms |
+| Robin Hood hashing | 177,144 ms |
+| Late materialization (`value_t`) | 112,454 ms |
+| Column store | 58,782 ms |
+| Unchained hash table | 47,658 ms |
+| Final parallel version | **9,475 ms** |
 
-constexpr size_t PAGE_SIZE = 8192;
+Overall, this corresponds to a **94.5% reduction in execution time**.
 
-struct alignas(8) Page {
-    std::byte data[PAGE_SIZE];
-};
+## Correctness and testing
 
-struct Column {
-    DataType           type;
-    std::vector<Page*> pages;
-};
+To make sure the optimizations did not break correctness, I used the provided tooling and also wrote unit tests for the custom data structures.
 
-struct ColumnarTable {
-    size_t              num_rows;
-    std::vector<Column> columns;
-};
-```
+The repository includes tests for:
+- the unchained hash table
+- the column-store implementation
 
-A `ColumnarTable` first stores how many rows the table has in the `num_rows` member, then stores each column seperately as a `Column`. Each `Column` has a type and stores the items of the column into several pages. Each page is of 8192 bytes. In each page:
+For correctness checking, the project also uses the provided DuckDB-based validation flow from the assignment.
 
-- The first 2 bytes are a `uint16_t` which is the number of rows $n_r$ in the page.
-- The following 2 bytes are a `uint16_t` which is the number of non-`NULL` values $n_v$ in the page.
-- The first $n_r$ bits in the last $\left\lfloor\frac{(n_r + 7)}{8}\right\rfloor$ bytes is a bitmap indicating whether the corresponding row has value or is `NULL`.
+## What I learned
 
-**Fixed-length attribute**: There are $n_v$ contiguous values begins at the first aligned position. For example, in a `Page` of `INT32`, the first value is at `data + 4`. While in a `Page` of `INT64` and `FP64`, the first value is at `data + 8`.
+This project taught me a lot about performance-oriented systems programming in C++.
 
-**Variable-length attribute**: There are $n_v$ contigous offsets (`uint16_t`) begins at `data + 4` in a `Page`, followed by the content of the varchars which begins at `char_begin = data + 4 + n_r * 2`. Each offset indicates the ending offset of the corresponding `VARCHAR` with respect to the `char_begin`.
+A few of the main takeaways for me were:
+- data layout matters just as much as algorithm choice
+- avoiding unnecessary string work can completely change performance
+- cache behavior has a huge effect on query execution
+- parallelism helps much more when the underlying data structures are already efficient
+- performance improvements are only meaningful if correctness is preserved
 
-**Long string**: When the length of a string is longer than `PAGE_SIZE - 7`, it can not fit in a normal page. Special pages will be used to store such string. If $n_r$ `== 0xffff` or $n_r$ `== 0xfffe`, the `Page` is a special page for long string. `0xffff` means the page is the first page of a long string and `0xfffe` means the page is the following page of a long string. The following 2 bytes is a `uint16_t` indicating the number of chars in the page, beginning at `data + 4`.
+## Build and run
 
-## Requirement
+Run all commands from the root of the repository.
 
-- You can only modify the file `src/execute.cpp` in the project.
-- You must not use any third-party libraries. If you are using libraries for development (e.g., for logging), ensure to remove them before the final submission.
-- The joining pipeline (including order and build side) is optimized by PostgreSQL for `Hash Join` only. However, in the `execute` function, you are free to use other algorithms and change the pipeline, as long as the result is equivalent.
-- For any struct listed above, all of there members are public. You can manipulate them in free functions as desired as long as the original files are not changed and the manipulated objects can be destructed properly.
-- Your program will be evaluated on an unpublished benchmark sampled from the original JOB benchmark. You will not be able to access the test benchmark.
-
-## Quick start
-
-> [!TIP]
-> Run all the following commands in the root directory of this project.
-
-First, download the imdb dataset.
-
-```bash
-./download_imdb.sh
-```
-
-Second, build the project.
-
+### Build the project
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
 cmake --build build -- -j $(nproc)
-```
 
-Third, prepare the DuckDB database for correctness checking.
+Build the cache
+bash
 
-```bash
-./build/build_database imdb.db
-```
-
-Now, you can run the tests:
-```bash
-./build/run plans.json
-```
-> [!TIP]
-> If you want to use `Ninja Multi-Config` as the generator. The commands will look like:
-> 
->```bash
-> cmake -S . -B build -Wno-dev -G "Ninja Multi-Config"
-> cmake --build build --config Release -- -j $(nproc)
-> ./build/Release/build_database imdb.db
-> ./build/Release/run plans.json
-> ```
-
-# Cache
-## This section is only for UNIX users
-There are 2 new executables with this repository. They cache the join tables and
-result of each query and mmap them for faster loading times and getting rid of duckdb.
-
-To build the cache you need to run:
-```bash
 ./build/build_cache plans.json
-```
 
-> [!TIP] 
-> If you are using `Linux x86_64` you can download our prebuilt cache with:
-> ```
-> wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_x86.tar.gz
-> ```
-> If you are using `macOS arm64` you can download our prebuilt cache with:
-> ```
-> wget http://share.uoa.gr/protected/all-download/sigmod25/sigmod25_cache_arm.tar.gz
-> ```
-> For all other systems you will need to build the cache on your own.
+Run the benchmarked version
+bash
 
-After the cache is built you can run the queries using:
-```bash
 ./build/fast plans.json
-```
 
-Also after you have built the cache you no longer need to build the `run` executable
-every time (which depends on duckdb and can be slow to compile). Just compile 
-the executable that uses the cache:
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Wno-dev
-cmake --build build -- -j $(nproc) fast
-```
+Run correctness checks
+bash
 
-Code is compiled with Clang 18.
+./build/run plans.json
+
+Run unit tests
+bash
+
+cmake --build build --target test_unchained test_column_store
+./build/test_column_store
+./build/test_unchained
+
+Report
+
+The full course report is included in this repository as Report.pdf.
+It contains the more detailed explanation of the design choices, experiments, and implementation process behind the final result.
+Assignment context
+
+This project was originally developed as a university assignment inspired by the SIGMOD 2025 programming contest. The original assignment description is included in ASSIGNMENT.md.
